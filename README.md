@@ -1,47 +1,66 @@
-# Keycloak & PostgreSQL local development with Docker Compose
+# 🧙‍♂️ Workflow Wizard — Agentic Workflow Orchestration Platform
 
-This repository provides a containerized development environment for PostgreSQL and Keycloak, eliminating the need to install these dependencies locally.
+**Workflow Wizard** is an enterprise-grade, microservice-based **Agentic Workflow Orchestration Platform**. It provides containerized, highly scalable infrastructure for building, executing, and orchestrating intelligent AI workflows, Retrieval-Augmented Generation (RAG) pipelines, and autonomous agent tasks.
 
-## Prerequisites
-* Docker and Docker Compose installed and running on your system.
+---
 
-## Getting Started
+## 🏗️ Platform Architecture & Services
 
-1. **Configure Environment**:
-   Verify or customize settings/credentials in the [.env](.env) file:
-   * `DB_DATABASE`: The database name (default: `keycloak`)
-   * `DB_USERNAME`: Database username (default: `keycloak`)
-   * `DB_PASSWORD`: Database password
-   * `KEYCLOAK_ADMIN_USER`: Admin console username (default: `admin`)
-   * `KEYCLOAK_ADMIN_PASSWORD`: Admin console password
+The platform operates as a suite of decoupled microservices and infrastructure adapters managed via Docker Compose:
 
-2. **Start Services**:
-   Run the following command in the project directory to build (if using Dockerfile) and start services in the background:
-   ```bash
-   docker compose up -d
-   ```
+| Service Name | Port | Description |
+|---|---|---|
+| **Workflow Backend** | `8000` | Core FastAPI microservice managing workflows, authentication integration, and task orchestration. |
+| **RAG Service** | `8001` | Microservice dedicated to data source ingestion, document indexing, chunking, and vector retrieval. |
+| **Keycloak IAM** | `8080` | Enterprise identity and access management provider with OIDC / OAuth2 authentication. |
+| **MinIO Console** | `9001` | S3-compatible Object Storage Web Console (Login: `admin` / `minio_password`). |
+| **MinIO S3 API** | `9000` | Internal S3 object storage endpoint for documents and binary artifacts. |
+| **Qdrant Vector DB** | `6333` | Vector database engine for high-dimensional embedding storage and similarity search. |
+| **Redis** | `6379` | High-performance in-memory cache and Celery task queue message broker. |
+| **HashiCorp Vault** | `8201` | Secure secret engine for managing secrets, API keys, and environment tokens. |
+| **PostgreSQL DB** | `5432` | Primary relational database hosting `keycloak` DB and dedicated `rag_db`. |
+| **pgAdmin** | `5050` | Web-based administration UI for PostgreSQL databases. |
 
-3. **Access Services**:
-   * **Keycloak Admin Console**: Navigate to [http://localhost:8080](http://localhost:8080) and log in with your admin credentials.
-   * **pgAdmin (Database UI)**: Navigate to [http://localhost:5050](http://localhost:5050).
-     * Login: `admin@admin.com` / `admin` (or customized values in `.env`).
-     * **To connect to the database in pgAdmin**:
-       1. Click **Add New Server**.
-       2. Set **Name** to `Keycloak Local`.
-       3. In the **Connection** tab, enter:
-          * **Host name/address**: `postgres` (use the service name defined in docker-compose.yml)
-          * **Port**: `5432`
-          * **Username**: `keycloak` (or value of `DB_USERNAME` in `.env`)
-          * **Password**: `keycloak_password` (or value of `DB_PASSWORD` in `.env`)
-       4. Save the connection to view databases, schemas, and tables.
-   * **PostgreSQL Database (Direct)**: Direct connections can be made from your host machine via standard database clients (e.g. DBeaver, pgAdmin local app) at `localhost:5432` using credentials from the `.env` file.
+---
 
-4. **Shutdown Services**:
-   To stop and remove containers while preserving database volume data:
-   ```bash
-   docker compose down
-   ```
-   To also remove the volume (factory reset database):
-   ```bash
-   docker compose down -v
-   ```
+## 🛠️ Getting Started
+
+### 1. Prerequisites
+- Docker and Docker Compose installed and running on your system.
+
+### 2. Environment Configuration
+Verify or customize credentials in the [.env](.env) file:
+- `DB_DATABASE`: Main database name (`keycloak`)
+- `RAG_DB_DATABASE`: Dedicated RAG database name (`rag_db`)
+- `RAG_DB_USERNAME`: RAG database username (`rag_user`)
+- `RAG_DB_PASSWORD`: RAG database password (`rag_password`)
+- `MINIO_ROOT_USER`: MinIO admin username (`admin`)
+- `MINIO_ROOT_PASSWORD`: MinIO admin password (`minio_password`)
+- `KEYCLOAK_ADMIN_USER`: Keycloak admin username (`admin`)
+
+### 3. Launching the Platform
+Start all microservices and infrastructure containers in the background:
+```bash
+docker compose up -d
+```
+
+### 4. Interactive Documentation & Dashboards
+- **RAG Service Swagger UI**: [http://localhost:8001/docs](http://localhost:8001/docs)
+- **Workflow Backend Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **MinIO Storage Console**: [http://localhost:9001](http://localhost:9001)
+- **Keycloak IAM Console**: [http://localhost:8080](http://localhost:8080)
+- **pgAdmin UI**: [http://localhost:5050](http://localhost:5050)
+
+---
+
+## 🧹 Managing Services
+
+Stop services while preserving database and object storage volume data:
+```bash
+docker compose down
+```
+
+To perform a complete factory reset (removing persistent volume data):
+```bash
+docker compose down -v
+```

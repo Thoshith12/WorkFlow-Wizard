@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: keycloak-db
+    container_name: workflow-db
     environment:
       POSTGRES_DB: ${DB_DATABASE:-keycloak}
       POSTGRES_USER: ${DB_USERNAME:-keycloak}
@@ -20,10 +20,9 @@ services:
       timeout: 5s
       retries: 5
 
-
   keycloak:
     image: quay.io/keycloak/keycloak:24.0.1
-    container_name: keycloak-server
+    container_name: workflow-keycloak
     command: start-dev
     environment:
       KC_DB: postgres
@@ -40,7 +39,7 @@ services:
 
   pgadmin:
     image: dpage/pgadmin4
-    container_name: keycloak-pgadmin
+    container_name: workflow-pgadmin
     environment:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@admin.com}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
@@ -52,7 +51,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: keycloak-redis
+    container_name: workflow-redis
     ports:
       - "6379:6379"
     volumes:
@@ -109,13 +108,12 @@ services:
       timeout: 3s
       retries: 5
 
-
-  # ── Backend microservice (replaces fastapi-keycloak-app) ────────────────────
+  # ── Backend microservice ───────────────────────────────────────────────────
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: keycloak-backend
+    container_name: workflow-backend
     ports:
       - "${FASTAPI_PORT:-8000}:8000"
     env_file:
@@ -156,7 +154,6 @@ services:
       - QDRANT_HOST=qdrant
       - REDIS_HOST=redis
       - MINIO_ENDPOINT=minio:9000
-
     depends_on:
       postgres:
         condition: service_healthy
@@ -172,7 +169,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: backend-celery-worker
+    container_name: workflow-celery-worker
     env_file:
       - .env
     environment:
@@ -188,4 +185,3 @@ volumes:
   vault_data:
   qdrant_data:
   minio_data:
-
