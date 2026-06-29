@@ -1,0 +1,13 @@
+# Environment Files
+.env
+.env.*
+!.env.example
+*.env
+
+# Python Cache & Virtual Envs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/

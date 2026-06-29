@@ -1,0 +1,30 @@
+# ── Core framework ────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+
+# ── Keycloak ──────────────────────────────────────────────────────────────────
+python-keycloak>=4.0.0
+
+# ── Validation ────────────────────────────────────────────────────────────────
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-multipart>=0.0.9
+email-validator>=2.1.0
+PyJWT>=2.8.0
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy>=2.0.0
+asyncpg>=0.29.0              # Async PostgreSQL driver
+psycopg2-binary>=2.9.0       # Sync driver for Alembic
+alembic>=1.13.0
+
+# ── Infrastructure clients ────────────────────────────────────────────────────
+redis>=5.0.0
+qdrant-client>=1.9.0
+hvac>=2.1.0                  # HashiCorp Vault
+
+# ── Background tasks ─────────────────────────────────────────────────────────
+celery>=5.3.0
+
+# ── Observability ─────────────────────────────────────────────────────────────
+# (JsonFormatter in shared/logging — no extra deps required)

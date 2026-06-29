@@ -1,0 +1,191 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: keycloak-db
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-keycloak}
+      POSTGRES_USER: ${DB_USERNAME:-keycloak}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-keycloak_password}
+      RAG_DB_DATABASE: ${RAG_DB_DATABASE:-rag_db}
+      RAG_DB_USERNAME: ${RAG_DB_USERNAME:-rag_user}
+      RAG_DB_PASSWORD: ${RAG_DB_PASSWORD:-rag_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.1
+    container_name: keycloak-server
+    command: start-dev
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${DB_DATABASE:-keycloak}
+      KC_DB_USERNAME: ${DB_USERNAME:-keycloak}
+      KC_DB_PASSWORD: ${DB_PASSWORD:-keycloak_password}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN_USER:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: keycloak-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@admin.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: keycloak-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  vault:
+    image: hashicorp/vault:1.15.0
+    container_name: vault-server
+    ports:
+      - "8201:8200"
+    volumes:
+      - ./vault/config:/vault/config
+      - vault_data:/vault/data
+    environment:
+      - VAULT_ADDR=http://127.0.0.1:8200
+    command: server
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD-SHELL", "vault status -address=http://127.0.0.1:8200 || [ $$? -eq 2 ]"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    container_name: qdrant-server
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-03-03T17-50-39Z
+    container_name: minio-server
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web Console UI
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_password}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+
+  # ── Backend microservice (replaces fastapi-keycloak-app) ────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: keycloak-backend
+    ports:
+      - "${FASTAPI_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      - KEYCLOAK_SERVER_URL=http://keycloak:8080/
+      - REDIS_HOST=redis
+      - QDRANT_HOST=qdrant
+      - VAULT_ADDR=http://vault:8200
+      - DB_HOST=postgres
+    depends_on:
+      keycloak:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      minio:
+        condition: service_healthy
+
+  # ── RAG microservice ────────────────────────────────────────────────────────
+  rag-service:
+    build:
+      context: ./backend
+      dockerfile: services/rag-service/Dockerfile
+    container_name: rag-service
+    ports:
+      - "${RAG_SERVICE_PORT:-8001}:8001"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=postgres
+      - DB_DATABASE=${RAG_DB_DATABASE:-rag_db}
+      - DB_USERNAME=${RAG_DB_USERNAME:-rag_user}
+      - DB_PASSWORD=${RAG_DB_PASSWORD:-rag_password}
+      - QDRANT_HOST=qdrant
+      - REDIS_HOST=redis
+      - MINIO_ENDPOINT=minio:9000
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # ── Celery workers ──────────────────────────────────────────────────────────
+  backend-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: backend-celery-worker
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  vault_data:
+  qdrant_data:
+  minio_data:
+

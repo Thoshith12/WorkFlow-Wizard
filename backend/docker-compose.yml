@@ -1,0 +1,39 @@
+# Backend-only docker-compose for isolated service development.
+# For full stack, use the root docker-compose.yml instead.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: keycloak-backend
+    ports:
+      - "${FASTAPI_PORT:-8000}:8000"
+    env_file:
+      - ../.env
+    environment:
+      - KEYCLOAK_SERVER_URL=http://keycloak:8080/
+    volumes:
+      - ./app:/workspace/app        # Hot-reload during development
+      - ./shared:/workspace/shared  # Shared package hot-reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      - keycloak
+      - redis
+      - postgres
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: backend-celery-worker
+    env_file:
+      - ../.env
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    depends_on:
+      - redis
+
+networks:
+  default:
+    name: keycloak_network
+    external: true

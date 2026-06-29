@@ -1,0 +1,29 @@
+services:
+  rag-service:
+    build:
+      context: ../..          # backend/ root (so shared/ is accessible)
+      dockerfile: services/rag-service/Dockerfile
+    container_name: rag-service
+    ports:
+      - "${RAG_SERVICE_PORT:-8001}:8001"
+    env_file:
+      - ../../.env
+    volumes:
+      - ./app:/workspace/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+
+  rag-celery-worker:
+    build:
+      context: ../..
+      dockerfile: services/rag-service/Dockerfile
+    container_name: rag-celery-worker
+    env_file:
+      - ../../.env
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    depends_on:
+      - redis
+
+networks:
+  default:
+    name: keycloak_network
+    external: true
