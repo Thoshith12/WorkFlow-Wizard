@@ -1,0 +1,39 @@
+FROM python:3.11-slim
+
+WORKDIR /workspace
+
+# Build tools needed to compile fasttext-wheel from source on Python 3.11
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    gcc \
+    g++ \
+    make \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install shared package
+COPY shared/ ./shared/
+RUN pip install --no-cache-dir -e ./shared
+
+# Install rag-service dependencies
+COPY services/rag-service/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Download FastText language-identification model
+RUN curl -fSL -o /workspace/lid.176.ftz \
+    https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
+
+# Copy application code
+COPY services/rag-service/app/ ./app/
+
+# Setup user
+RUN adduser --disabled-password --gecos "" appuser \
+    && chown -R appuser:appuser /workspace
+
+USER appuser
+
+# Health check using Celery ping to ensure the worker is responsive
+HEALTHCHECK --interval=30s --timeout=15s --start-period=15s --retries=3 \
+    CMD celery -A app.core.celery_app inspect ping || exit 1
+
+ENTRYPOINT ["celery", "-A", "app.core.celery_app", "worker", "--loglevel=info"]

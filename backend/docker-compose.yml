@@ -23,19 +23,6 @@ services:
       - redis
       - postgres
 
-  celery-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: workflow-backend-worker:latest
-    container_name: workflow-celery-worker
-    env_file:
-      - ../.env
-    command: celery -A app.tasks.celery_app worker --loglevel=info
-    depends_on:
-      - redis
-
-
 networks:
   default:
     name: workflow_network

@@ -15,11 +15,18 @@ services:
   rag-celery-worker:
     build:
       context: ../..
-      dockerfile: services/rag-service/Dockerfile
+      dockerfile: services/rag-service/Dockerfile.worker
     container_name: rag-celery-worker
     env_file:
       - ../../.env
-    command: celery -A app.tasks.celery_app worker --loglevel=info
+    environment:
+      - DB_HOST=postgres
+      - DB_DATABASE=${RAG_DB_DATABASE:-rag_db}
+      - DB_USERNAME=${RAG_DB_USERNAME:-rag_user}
+      - DB_PASSWORD=${RAG_DB_PASSWORD:-rag_password}
+      - QDRANT_HOST=qdrant
+      - REDIS_HOST=redis
+      - MINIO_ENDPOINT=minio:9000
     depends_on:
       - redis
 
