@@ -25,3 +25,16 @@ redis>=5.0.0
 
 # ── Embeddings (add model-specific client here) ───────────────────────────────
 # openai>=1.0.0
+
+# ── Text Extraction ──────────────────────────────────────────────────────────
+langchain>=0.1.0
+langchain-community>=0.0.10
+pypdf>=4.0.0
+docx2txt>=0.8
+
+# ── NumPy pinning for FastText compatibility ─────────────────────────────────
+numpy<2.0.0
+
+# ── Text Pre-Processing ──────────────────────────────────────────────────────
+ftfy>=6.1.0
+fasttext-wheel>=0.9.2

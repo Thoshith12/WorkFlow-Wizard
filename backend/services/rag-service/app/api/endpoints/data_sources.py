@@ -13,14 +13,15 @@ import logging
 import os
 from typing import List
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.config.settings import settings
 from shared.database.utils.pool import get_db
-from app.pipeline.ingestion import run_ingestion_pipeline
+from app.pipeline import run_ingestion_pipeline, run_extraction_pipeline
 from app.repositories import data_source as ds_repo
 from app.schemas.data_source import IngestResponse
+
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt"}
     summary="Ingest Files",
 )
 async def ingest_files(
+    background_tasks: BackgroundTasks,
     name: str = Form(
         ...,
         description="Unique data source name.",
@@ -122,9 +124,14 @@ async def ingest_files(
     logger.info(
         "API Request validated for '%s'. Dispersing task to Ingestion Pipeline...", name
     )
-    return await run_ingestion_pipeline(
+    res = await run_ingestion_pipeline(
         db,
         name=name,
         description=description,
         file_contents=file_contents,
     )
+    # Commit early so records are visible to the background task
+    await db.commit()
+    background_tasks.add_task(run_extraction_pipeline, res.data_source_id)
+    return res
+

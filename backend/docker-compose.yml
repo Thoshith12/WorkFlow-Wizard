@@ -6,6 +6,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: workflow-backend:latest
     container_name: workflow-backend
     ports:
       - "${FASTAPI_PORT:-8000}:8000"
@@ -26,12 +27,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: workflow-backend-worker:latest
     container_name: workflow-celery-worker
     env_file:
       - ../.env
     command: celery -A app.tasks.celery_app worker --loglevel=info
     depends_on:
       - redis
+
 
 networks:
   default:

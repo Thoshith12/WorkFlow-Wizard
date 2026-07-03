@@ -16,7 +16,7 @@ class DocumentOut(BaseModel):
     """Single document in the ingestion response."""
     document_id: UUID = Field(..., description="Unique document identifier.")
     file_name: str = Field(..., description="Original uploaded file name.")
-    status: str = Field(..., description="Document processing status.")
+    pipeline_status: str = Field(..., description="Document processing status.")
     storage_path: str = Field(
         ..., description="Storage path in object storage."
     )

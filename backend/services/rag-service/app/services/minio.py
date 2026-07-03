@@ -127,6 +127,44 @@ class MinioStorageClient:
         logger.info("MinIO upload complete: %s", storage_path)
         return storage_path
 
+    def _get_object_sync(self, bucket_name: str, object_name: str) -> bytes:
+        """Synchronous helper for downloading object bytes."""
+        client = self._get_client()
+        response = None
+        try:
+            response = client.get_object(bucket_name, object_name)
+            return response.read()
+        finally:
+            if response:
+                response.close()
+                response.release_conn()
+
+    async def get_file(self, object_name: str) -> bytes:
+        """
+        Download object bytes from MinIO bucket.
+
+        Args:
+            object_name: Key of the object in the bucket (e.g. "uuid/file.pdf").
+
+        Returns:
+            The raw file bytes.
+        """
+        target_bucket = settings.MINIO_BUCKET
+        await self.ensure_bucket(target_bucket)
+        
+        logger.info(
+            "Downloading from MinIO bucket '%s': %s",
+            target_bucket, object_name,
+        )
+        
+        content = await asyncio.to_thread(
+            self._get_object_sync,
+            target_bucket,
+            object_name,
+        )
+        return content
+
 
 # Module-level singleton instance
 minio_client = MinioStorageClient()
+

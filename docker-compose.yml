@@ -113,6 +113,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: workflow-backend:latest
     container_name: workflow-backend
     ports:
       - "${FASTAPI_PORT:-8000}:8000"
@@ -141,6 +142,7 @@ services:
     build:
       context: ./backend
       dockerfile: services/rag-service/Dockerfile
+    image: workflow-rag-service:latest
     container_name: rag-service
     ports:
       - "${RAG_SERVICE_PORT:-8001}:8001"
@@ -169,6 +171,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: workflow-backend-worker:latest
     container_name: workflow-celery-worker
     env_file:
       - .env
@@ -178,6 +181,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+
 
 volumes:
   postgres_data:

@@ -20,7 +20,7 @@ async def create_document(
     *,
     data_source_id: UUID,
     file_name: str,
-    status: str = "stored",
+    pipeline_status: str = "stored",
     config: Optional[Dict[str, Any]] = None,
 ) -> Document:
     """
@@ -30,7 +30,7 @@ async def create_document(
         db:             Active async session.
         data_source_id: Parent data source FK.
         file_name:      Original uploaded file name.
-        status:         Initial document status (default: 'stored').
+        pipeline_status: Initial document status (default: 'stored').
         config:         JSONB metadata (storage_path, content_type, size, etc.).
 
     Returns:
@@ -39,7 +39,7 @@ async def create_document(
     doc = Document(
         data_source_id=data_source_id,
         file_name=file_name,
-        status=status,
+        pipeline_status=pipeline_status,
         config=config or {},
     )
     db.add(doc)

@@ -76,7 +76,7 @@ async def run_ingestion_pipeline(
             db,
             data_source_id=data_source.id,
             file_name=fc["filename"],
-            status="stored",
+            pipeline_status="stored",
             config={
                 "storage_path": storage_path,
                 "content_type": fc["content_type"],
@@ -88,7 +88,7 @@ async def run_ingestion_pipeline(
             DocumentOut(
                 document_id=doc.id,
                 file_name=doc.file_name,
-                status=doc.status,
+                pipeline_status=doc.pipeline_status,
                 storage_path=storage_path,
             )
         )

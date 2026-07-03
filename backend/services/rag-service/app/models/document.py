@@ -2,18 +2,15 @@
 app.models.document — Document ORM model.
 
 Represents a single uploaded file within a DataSource. Tracks the file's
-lifecycle from upload (stored) through processing stages.
-
-Status flow:  pending → stored → processing → processed → failed
-              └───────────────────────────────────────────┘ (retry)
+lifecycle from upload through processing stages.
 
 The `config` JSONB blob stores per-document metadata that varies by file
-type and pipeline stage (storage path, MIME type, byte size, chunk IDs, etc.).
+type and pipeline stage (storage path, MIME type, byte size, etc.).
 """
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, ForeignKey, String, Text, text
+from sqlalchemy import Column, DateTime, ForeignKey, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
@@ -37,15 +34,28 @@ class Document(Base):
     )
 
     file_name = Column(String(512), nullable=False)
-    language_detected = Column(String(10), nullable=True)
-    status = Column(
-        String(20),
-        nullable=False,
+    
+    # ── Pipeline tracking (migration 004 refactored) ──────────────────────────
+    pipeline_status = Column(
+        String(50), 
+        nullable=False, 
         default="pending",
         server_default=text("'pending'"),
-        index=True,
+        index=True
     )
+    language_detected = Column(
+        JSONB,
+        nullable=True,
+        server_default=text("'[]'::jsonb"),
+    )
+    errors = Column(
+        JSONB,
+        nullable=True,
+        server_default=text("'{}'::jsonb"),
+    )
+
     config = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -66,5 +76,7 @@ class Document(Base):
     def __repr__(self) -> str:
         return (
             f"<Document id={self.id} file={self.file_name!r} "
-            f"status={self.status!r}>"
+            f"pipeline_status={self.pipeline_status!r}>"
         )
+
+

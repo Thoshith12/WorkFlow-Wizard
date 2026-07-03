@@ -47,6 +47,18 @@ def configure_logging(
 
     root_logger.addHandler(handler)
 
-    # Silence noisy third-party loggers
+    # ── Silence / deduplicate noisy third-party loggers ───────────────────────
+    # uvicorn.access: only log WARNING+ (suppress per-request access lines)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+
+    # sqlalchemy.engine: SQLAlchemy registers its own plaintext StreamHandler
+    # internally (via echo=True or its default setup), which causes every SQL
+    # statement to appear TWICE — once in SQLAlchemy's own plaintext format and
+    # once in JSON via propagation to the root logger.
+    # Fix: clear its own handlers + raise level to WARNING so INFO-level SQL
+    # chatter (SELECT, BEGIN, COMMIT) is suppressed entirely. WARNING/ERROR SQL
+    # events still propagate to root in JSON format.
+    _sa_logger = logging.getLogger("sqlalchemy.engine")
+    _sa_logger.handlers.clear()
+    _sa_logger.setLevel(logging.WARNING)
+    _sa_logger.propagate = True   # WARNING+ still reaches root → JSON output

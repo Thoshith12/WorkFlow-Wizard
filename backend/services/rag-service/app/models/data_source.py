@@ -31,6 +31,15 @@ class DataSource(Base):
     name = Column(String(255), nullable=False, unique=True, index=True)
     description = Column(Text, nullable=False, default="")
     config = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    status = Column(
+        String(50),
+        nullable=False,
+        default="pending",
+        server_default=text("'pending'"),
+        index=True,
+    )
+    error = Column(Text, nullable=True)
+
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
