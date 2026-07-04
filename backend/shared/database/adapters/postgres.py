@@ -51,7 +51,7 @@ class PostgresAdapter(DatabaseAdapter):
 
         self._engine = create_async_engine(
             settings.database_url,
-            echo=settings.ENVIRONMENT == "development",
+            echo=False,
             pool_size=5,
             max_overflow=10,
             pool_recycle=1800,

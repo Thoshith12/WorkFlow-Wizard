@@ -52,13 +52,14 @@ def configure_logging(
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
     # sqlalchemy.engine: SQLAlchemy registers its own plaintext StreamHandler
-    # internally (via echo=True or its default setup), which causes every SQL
-    # statement to appear TWICE — once in SQLAlchemy's own plaintext format and
-    # once in JSON via propagation to the root logger.
-    # Fix: clear its own handlers + raise level to WARNING so INFO-level SQL
-    # chatter (SELECT, BEGIN, COMMIT) is suppressed entirely. WARNING/ERROR SQL
-    # events still propagate to root in JSON format.
+    # internally if echo=True is used, causing statements to appear twice.
+    # Fix: we set echo=False on the engine and manage the logging level here.
+    # We clear its own handlers and propagate statements to the root logger
+    # so they are formatted cleanly as JSON objects in development.
     _sa_logger = logging.getLogger("sqlalchemy.engine")
     _sa_logger.handlers.clear()
-    _sa_logger.setLevel(logging.WARNING)
-    _sa_logger.propagate = True   # WARNING+ still reaches root → JSON output
+    if level.upper() in ("DEBUG", "INFO"):
+        _sa_logger.setLevel(logging.INFO)
+    else:
+        _sa_logger.setLevel(logging.WARNING)
+    _sa_logger.propagate = True   # Propagate to root to output as JSON

@@ -1,3 +1,18 @@
+"""
+app.pipeline.extraction.service — Extraction Pipeline.
+
+Downloads documents from MinIO, extracts text using format-appropriate loaders,
+stores raw page data in Redis, and triggers preprocessing.
+
+Redis key convention:
+  Output: {data_source_id}_{document_id}_extracted_text  (consumed by preprocessing)
+
+Extracted payload format:
+  [{"page_number": 1, "page_content": "raw text...", "metadata": {...}}, ...]
+
+pipeline_status transitions:
+  extraction initiated → extraction completed | failed
+"""
 import json
 import logging
 import os

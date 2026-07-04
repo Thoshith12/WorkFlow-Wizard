@@ -9,7 +9,7 @@ Redis key conventions:
   Output: {data_source_id}_{document_id}_preprocessed_text  (consumed by chunking)
 
 Preprocessed payload format:
-  [{"page_number": 1, "content": "cleaned text..."}, ...]
+  [{"page_number": 1, "content": "cleaned text..."}]
   Only quality-passing pages are included.
 
 pipeline_status transitions:

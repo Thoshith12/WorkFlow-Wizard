@@ -36,4 +36,4 @@ USER appuser
 HEALTHCHECK --interval=30s --timeout=15s --start-period=15s --retries=3 \
     CMD celery -A app.core.celery_app inspect ping || exit 1
 
-ENTRYPOINT ["celery", "-A", "app.core.celery_app", "worker", "--loglevel=info"]
+ENTRYPOINT ["celery", "-A", "app.core.celery_app", "worker", "--loglevel=info", "--concurrency", "4"]
