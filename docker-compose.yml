@@ -9,6 +9,9 @@ services:
       RAG_DB_DATABASE: ${RAG_DB_DATABASE:-rag_db}
       RAG_DB_USERNAME: ${RAG_DB_USERNAME:-rag_user}
       RAG_DB_PASSWORD: ${RAG_DB_PASSWORD:-rag_password}
+      TOOLS_DB_DATABASE: ${TOOLS_DB_DATABASE:-tools_db}
+      TOOLS_DB_USERNAME: ${TOOLS_DB_USERNAME:-tools_user}
+      TOOLS_DB_PASSWORD: ${TOOLS_DB_PASSWORD:-tools_password}
     ports:
       - "5432:5432"
     volumes:
@@ -160,8 +163,7 @@ services:
       - SENTENCE_TRANSFORMERS_HOME=/workspace/.cache/huggingface/sentence-transformers
     volumes:
       - ./backend/services/rag-service/app:/workspace/app
-      - hf_model_cache:/workspa
-      ce/.cache/huggingface
+      - hf_model_cache:/workspace/.cache/huggingface
     depends_on:
       postgres:
         condition: service_healthy
@@ -205,6 +207,38 @@ services:
       minio:
         condition: service_healthy
 
+  # ── Tools microservice ──────────────────────────────────────────────────────
+  tools-service:
+    build:
+      context: ./backend
+      dockerfile: services/tools-service/Dockerfile
+    image: workflow-tools-service:latest
+    container_name: tools-service
+    ports:
+      - "${TOOLS_SERVICE_PORT:-8002}:8002"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=postgres
+      - DB_DATABASE=${TOOLS_DB_DATABASE:-tools_db}
+      - DB_USERNAME=${TOOLS_DB_USERNAME:-tools_user}
+      - DB_PASSWORD=${TOOLS_DB_PASSWORD:-tools_password}
+      - REDIS_HOST=redis
+      - KEYCLOAK_SERVER_URL=http://keycloak:8080/
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    volumes:
+      - ./backend/services/tools-service/app:/workspace/app
+      - tool_venv_cache:/tmp/tool-venvs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+
 
 volumes:
   postgres_data:
@@ -213,5 +247,7 @@ volumes:
   qdrant_data:
   minio_data:
   hf_model_cache:
+    driver: local
+  tool_venv_cache:
     driver: local
 

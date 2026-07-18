@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     # ── Service Ports ─────────────────────────────────────────────────────────
     FASTAPI_PORT: int = Field(default=8000)
     RAG_SERVICE_PORT: int = Field(default=8001)
+    TOOLS_SERVICE_PORT: int = Field(default=8002)
 
     # ── Environment ───────────────────────────────────────────────────────────
     ENVIRONMENT: str = Field(default="development")

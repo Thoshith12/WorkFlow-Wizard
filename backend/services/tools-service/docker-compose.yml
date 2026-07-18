@@ -1,0 +1,29 @@
+# tools-service local development compose
+# Used for standalone dev; the main deployment uses root docker-compose.yml.
+services:
+  tools-service:
+    build:
+      context: ../../
+      dockerfile: backend/services/tools-service/Dockerfile
+    image: workflow-tools-service:latest
+    container_name: tools-service
+    ports:
+      - "${TOOLS_SERVICE_PORT:-8002}:8002"
+    env_file:
+      - ../../.env
+    environment:
+      - DB_HOST=postgres
+      - DB_DATABASE=${TOOLS_DB_DATABASE:-tools_db}
+      - DB_USERNAME=${TOOLS_DB_USERNAME:-tools_user}
+      - DB_PASSWORD=${TOOLS_DB_PASSWORD:-tools_password}
+      - REDIS_HOST=redis
+      - KEYCLOAK_SERVER_URL=http://keycloak:8080/
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    volumes:
+      - ../../backend/services/tools-service/app:/workspace/app
+      - tool_venv_cache:/tmp/tool-venvs
+
+volumes:
+  tool_venv_cache:
