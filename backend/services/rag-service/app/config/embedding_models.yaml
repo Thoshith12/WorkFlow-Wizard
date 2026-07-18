@@ -1,0 +1,205 @@
+# app/config/embedding_models.yaml
+#
+# Embedding model registry for the RAG chunking pipeline.
+#
+# LANGUAGE CODES: All language codes are ISO 639-1 two-letter codes,
+# matching the exact output of FastText lid.176 language detection.
+# Example: FastText returns "__label__hi" → strip prefix → "hi" (Hindi).
+#
+# WILDCARD: A model with languages: ["*"] supports all 176 languages
+# in the FastText lid.176 corpus.
+#
+# MODEL SIZE CONSTRAINT: All models listed here are kept under 1 GB
+# in their float32 weights to ensure fast on-demand load/unload cycles.
+
+# ── Language Map ──────────────────────────────────────────────────────────────
+# ISO 639-1 → human-readable name. Used in error messages and logging.
+# Keeps consistent with FastText lid.176 language codes.
+language_map:
+  en: "English"
+  zh: "Chinese"
+  de: "German"
+  fr: "French"
+  es: "Spanish"
+  it: "Italian"
+  pt: "Portuguese"
+  nl: "Dutch"
+  pl: "Polish"
+  ru: "Russian"
+  ja: "Japanese"
+  ko: "Korean"
+  ar: "Arabic"
+  hi: "Hindi"
+  tr: "Turkish"
+  vi: "Vietnamese"
+  th: "Thai"
+  id: "Indonesian"
+  ms: "Malay"
+  tl: "Filipino"
+  cs: "Czech"
+  da: "Danish"
+  fi: "Finnish"
+  el: "Greek"
+  hu: "Hungarian"
+  no: "Norwegian"
+  sv: "Swedish"
+  uk: "Ukrainian"
+  he: "Hebrew"
+  ro: "Romanian"
+  bg: "Bulgarian"
+  hr: "Croatian"
+  sk: "Slovak"
+  sl: "Slovenian"
+  sr: "Serbian"
+  ca: "Catalan"
+  et: "Estonian"
+  lv: "Latvian"
+  lt: "Lithuanian"
+  fa: "Persian"
+  ur: "Urdu"
+  bn: "Bengali"
+  ta: "Tamil"
+  te: "Telugu"
+  ml: "Malayalam"
+  kn: "Kannada"
+  gu: "Gujarati"
+  mr: "Marathi"
+  pa: "Punjabi"
+  sw: "Swahili"
+  af: "Afrikaans"
+  sq: "Albanian"
+  hy: "Armenian"
+  az: "Azerbaijani"
+  eu: "Basque"
+  be: "Belarusian"
+  gl: "Galician"
+  ka: "Georgian"
+  is: "Icelandic"
+  ga: "Irish"
+  mk: "Macedonian"
+  mn: "Mongolian"
+  ne: "Nepali"
+  si: "Sinhala"
+  as: "Assamese"
+  or: "Odia"
+  sa: "Sanskrit"
+
+# ── Embedding Models ──────────────────────────────────────────────────────────
+models:
+  # English-only — fast, small (~90 MB)
+  - name: "sentence-transformers/all-MiniLM-L6-v2"
+    short_name: "minilm-l6"
+    dimensions: 384
+    max_tokens: 256
+    approximate_size_mb: 90
+    languages: ["en"]
+    description: >
+      Fast, compact English-only model (~90 MB).
+      Best for English-only corpora requiring low latency.
+    requires_prefix: false
+
+  # English-only — higher quality (~420 MB)
+  - name: "sentence-transformers/all-mpnet-base-v2"
+    short_name: "mpnet-base"
+    dimensions: 768
+    max_tokens: 384
+    approximate_size_mb: 420
+    languages: ["en"]
+    description: >
+      Higher quality English-only model (~420 MB).
+      Better semantic understanding than MiniLM at moderate speed cost.
+    requires_prefix: false
+
+  # Multilingual 50+ languages — compact (~420 MB)
+  - name: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    short_name: "multilingual-minilm"
+    dimensions: 384
+    max_tokens: 128
+    approximate_size_mb: 420
+    languages:
+      - "en"  # English
+      - "de"  # German
+      - "fr"  # French
+      - "es"  # Spanish
+      - "it"  # Italian
+      - "pt"  # Portuguese
+      - "nl"  # Dutch
+      - "pl"  # Polish
+      - "ru"  # Russian
+      - "zh"  # Chinese
+      - "ja"  # Japanese
+      - "ko"  # Korean
+      - "ar"  # Arabic
+      - "hi"  # Hindi
+      - "tr"  # Turkish
+      - "vi"  # Vietnamese
+      - "th"  # Thai
+      - "id"  # Indonesian
+      - "ms"  # Malay
+      - "tl"  # Filipino
+      - "cs"  # Czech
+      - "da"  # Danish
+      - "fi"  # Finnish
+      - "el"  # Greek
+      - "hu"  # Hungarian
+      - "no"  # Norwegian
+      - "sv"  # Swedish
+      - "uk"  # Ukrainian
+      - "he"  # Hebrew
+      - "ro"  # Romanian
+      - "bg"  # Bulgarian
+      - "hr"  # Croatian
+      - "sk"  # Slovak
+      - "sl"  # Slovenian
+      - "sr"  # Serbian
+      - "ca"  # Catalan
+      - "et"  # Estonian
+      - "lv"  # Latvian
+      - "lt"  # Lithuanian
+      - "fa"  # Persian
+      - "ur"  # Urdu
+      - "bn"  # Bengali
+      - "ta"  # Tamil
+      - "te"  # Telugu
+      - "ml"  # Malayalam
+      - "kn"  # Kannada
+      - "gu"  # Gujarati
+      - "mr"  # Marathi
+      - "pa"  # Punjabi
+      - "sw"  # Swahili
+    description: >
+      Fast multilingual model (~420 MB) supporting 50+ languages including
+      major Indian languages (Hindi, Tamil, Telugu, Malayalam, Kannada,
+      Gujarati, Marathi, Punjabi, Bengali, Urdu).
+    requires_prefix: false
+
+  # Microsoft Harrier OSS 0.6B — high-quality multilingual (~1.2 GB quantized, or ~2.4 GB fp32)
+  # Note: uses Qwen3 decoder architecture; loaded via sentence-transformers trust_remote_code=True
+  - name: "microsoft/harrier-oss-v1-0.6b"
+    short_name: "harrier-0.6b"
+    dimensions: 1024
+    max_tokens: 32768
+    approximate_size_mb: 1200
+    languages: ["*"]
+    description: >
+      Microsoft Harrier OSS v1 0.6B parameter multilingual embedding model.
+      Decoder-based (Qwen3 backbone), 32k context window, supports 100+ languages
+      including all major Indian languages. State-of-the-art on Multilingual MTEB v2.
+      Requires task instruction prefix on queries; no prefix on passages.
+    requires_prefix: true
+    prefix_query: "Instruct: Retrieve semantically similar text\nQuery: "
+    prefix_passage: ""
+
+  # BGE-M3 — universal, dense+sparse support (~570 MB)
+  - name: "BAAI/bge-m3"
+    short_name: "bge-m3"
+    dimensions: 1024
+    max_tokens: 8192
+    approximate_size_mb: 570
+    languages: ["*"]
+    description: >
+      BGE-M3 (~570 MB): supports all 100+ languages, 8192-token context window.
+      Natively supports dense vectors, sparse vectors, and multi-vector retrieval.
+      Best fallback for any language when used with hybrid or sparse embedding modes.
+    requires_prefix: false
+    supports_sparse: true

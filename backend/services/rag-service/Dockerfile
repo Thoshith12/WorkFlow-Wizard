@@ -25,6 +25,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN curl -fSL -o /workspace/lid.176.ftz \
     https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
 
+# Create HuggingFace model cache directory
+# Models are downloaded on first use and persisted via Docker volume mount.
+RUN mkdir -p /workspace/.cache/huggingface
+ENV HF_HOME=/workspace/.cache/huggingface
+ENV SENTENCE_TRANSFORMERS_HOME=/workspace/.cache/huggingface/sentence-transformers
+
 # Copy rag-service application, alembic migrations, and entrypoint script
 COPY services/rag-service/app/ ./app/
 COPY services/rag-service/alembic/ ./alembic/

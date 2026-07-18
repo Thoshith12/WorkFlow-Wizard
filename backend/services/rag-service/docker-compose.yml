@@ -10,6 +10,12 @@ services:
       - ../../.env
     volumes:
       - ./app:/workspace/app
+      # HuggingFace model disk cache — shared with the Celery worker so models
+      # are downloaded once and reused across container restarts.
+      - hf_model_cache:/workspace/.cache/huggingface
+    environment:
+      - HF_HOME=/workspace/.cache/huggingface
+      - SENTENCE_TRANSFORMERS_HOME=/workspace/.cache/huggingface/sentence-transformers
     command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 
   rag-celery-worker:
@@ -27,6 +33,15 @@ services:
       - QDRANT_HOST=qdrant
       - REDIS_HOST=redis
       - MINIO_ENDPOINT=minio:9000
+      # HuggingFace cache path — models are loaded on-demand and unloaded after each job.
+      - HF_HOME=/workspace/.cache/huggingface
+      - SENTENCE_TRANSFORMERS_HOME=/workspace/.cache/huggingface/sentence-transformers
+      # Agentic chunking — Claude Haiku 4.5
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      # Shared HuggingFace disk cache between API service and Celery workers.
+      # On first download the model files are written here; subsequent runs skip the download.
+      - hf_model_cache:/workspace/.cache/huggingface
     depends_on:
       - redis
 
@@ -34,3 +49,11 @@ networks:
   default:
     name: keycloak_network
     external: true
+
+volumes:
+  # Named volume for HuggingFace model disk cache.
+  # Models are downloaded once and persisted here across container restarts.
+  # Memory (VRAM/RAM) is managed separately: models are loaded on demand
+  # and explicitly unloaded after each data connector's chunks are processed.
+  hf_model_cache:
+    driver: local

@@ -23,9 +23,6 @@ qdrant-client>=1.9.0
 celery>=5.3.0
 redis>=5.0.0
 
-# ── Embeddings (add model-specific client here) ───────────────────────────────
-# openai>=1.0.0
-
 # ── Text Extraction ──────────────────────────────────────────────────────────
 langchain>=0.1.0
 langchain-community>=0.0.10
@@ -38,3 +35,19 @@ numpy<2.0.0
 # ── Text Pre-Processing ──────────────────────────────────────────────────────
 ftfy>=6.1.0
 fasttext-wheel>=0.9.2
+
+# ── Chunking ──────────────────────────────────────────────────────────────────
+langchain-text-splitters>=0.2.0
+PyYAML>=6.0
+
+# ── Embeddings (HuggingFace + PyTorch GPU) ────────────────────────────────────
+# torch: GPU inference with NVIDIA CUDA, Apple MPS, or Intel XPU fallback to CPU.
+# sentence-transformers: wrapper for HuggingFace embedding models.
+# NOTE: torch CPU wheel is listed here for Docker builds; GPU workers should
+# install the CUDA-enabled wheel via --index-url https://download.pytorch.org/whl/cu121
+sentence-transformers>=2.7.0
+torch>=2.2.0
+
+# ── Agentic chunking (Claude Haiku 4.5 via Anthropic API) ────────────────────
+anthropic>=0.25.0
+

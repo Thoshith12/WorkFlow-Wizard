@@ -30,6 +30,10 @@ OPENAPI_TAGS = [
         "description": "Data source ingestion and management endpoints.",
     },
     {
+        "name": "Chunking",
+        "description": "Chunking and embedding pipeline endpoints.",
+    },
+    {
         "name": "Health",
         "description": "Service liveness and readiness probes.",
     },
