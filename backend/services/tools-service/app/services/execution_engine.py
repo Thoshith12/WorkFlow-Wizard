@@ -94,12 +94,13 @@ class ExecutionEngine:
             status = ExecutionStatus.ERROR
             error_msg = str(exc)
         except Exception as exc:
+            import traceback
             status = ExecutionStatus.ERROR
             # Truncate error to prevent config/secret leakage via stack traces.
             error_msg = f"{type(exc).__name__}: {str(exc)[:500]}"
             logger.error(
-                "Tool execution failed: %s@%s — %s",
-                tool_name, tool_version, error_msg,
+                "Tool execution failed: %s@%s — %s\nTraceback:\n%s",
+                tool_name, tool_version, error_msg, traceback.format_exc()
             )
 
         duration_ms = (time.monotonic() - start) * 1000

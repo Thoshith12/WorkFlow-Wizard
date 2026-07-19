@@ -68,6 +68,14 @@ class LifespanHandler:
             logger.error("Failed to load tool registry on startup: %s", exc)
             raise
 
+        # Clear stale Redis boot locks left by any previous SIGKILL crash.
+        # Must run after Redis is connected (server_manager.startup above).
+        try:
+            from app.sandbox.pool import sandbox_pool
+            await sandbox_pool.clear_stale_locks()
+        except Exception as exc:
+            logger.warning("Failed to clear stale sandbox locks on startup: %s", exc)
+
         # Start in-process background reaper loop
         self._reaper_task = asyncio.create_task(self._run_reaper_loop())
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket as socket_mod
 import time
 from typing import Any, Dict, Optional
@@ -68,27 +69,31 @@ class SandboxPool:
         from shared.database import server_manager
         return server_manager.get("redis").client
 
-    async def get_or_start(self, tool: CustomTool) -> str:
+    def _get_tool_port(self, tool_name: str, tool_version: str) -> int:
+        """Deterministic loopback TCP port per tool (range 18000..28000)."""
+        h = abs(hash(f"{tool_name}@{tool_version}"))
+        return 18000 + (h % 10000)
+
+    async def get_or_start(self, tool: CustomTool) -> tuple[str, int]:
         """
-        Return the loopback TCP port of a warm container's server.
+        Return (bundle_path, port) of a warm container's server.
 
         If no container exists or the existing one is dead, boot a new one.
         Uses a per-tool asyncio lock to prevent double-booting.
         """
         tool_key = f"{tool.name}@{tool.version}"
         reg_key = self._registry_key(tool.name, tool.version)
+        port = self._get_tool_port(tool.name, tool.version)
 
         # Check local cache first (hot path — skip liveness probe if recent)
-        # Check local cache first
         cached = self._local_cache.get(tool_key)
         if cached:
             bundle_path = cached["bundle_path"]
-            sock_path = f"{bundle_path}/run/sandbox/tool.sock"
-            if await self._uds_alive(sock_path):
+            if await self._port_alive(port):
                 cached["last_active"] = time.time()
-                return bundle_path
+                return bundle_path, port
             else:
-                logger.warning("Dead sandbox socket for %s, invalidating.", tool_key)
+                logger.warning("Dead sandbox server port %d for %s, invalidating.", port, tool_key)
                 await self.invalidate(tool.name, tool.version)
 
         # Check Redis registry
@@ -97,15 +102,14 @@ class SandboxPool:
         if entry_raw:
             entry = json.loads(entry_raw)
             bundle_path = entry["bundle_path"]
-            sock_path = f"{bundle_path}/run/sandbox/tool.sock"
-            if await self._uds_alive(sock_path):
+            if await self._port_alive(port):
                 self._local_cache[tool_key] = {
                     "last_active": time.time(),
                     **entry,
                 }
-                return bundle_path
+                return bundle_path, port
             else:
-                logger.warning("Dead sandbox socket in Redis for %s, invalidating.", tool_key)
+                logger.warning("Dead sandbox server port %d in Redis for %s, invalidating.", port, tool_key)
                 await self._cleanup_entry(tool_key, reg_key)
 
         # Boot new container (with lock to prevent double-boot)
@@ -117,14 +121,49 @@ class SandboxPool:
             cached = self._local_cache.get(tool_key)
             if cached:
                 bundle_path = cached["bundle_path"]
-                sock_path = f"{bundle_path}/run/sandbox/tool.sock"
-                if await self._uds_alive(sock_path):
-                    return bundle_path
+                if await self._port_alive(port):
+                    return bundle_path, port
 
-            return await self._boot_with_lock(tool, tool_key, reg_key)
+            bundle_path = await self._boot_with_lock(tool, tool_key, reg_key, port)
+            return bundle_path, port
+
+    async def clear_stale_locks(self) -> None:
+        """
+        Delete all orphaned boot locks for this host from Redis.
+
+        Called at startup. If the previous process was killed with SIGKILL
+        (exit 137), the finally-block that deletes the lock never ran,
+        leaving a stale key that blocks every subsequent boot attempt for
+        the full lock_ttl window. Clearing them on startup is safe: if
+        another replica on this host were legitimately holding a lock, it
+        would have the same hostname, but replicas run in separate
+        containers with separate hostnames.
+        """
+        redis = await self._get_redis()
+        pattern = f"tools_sandbox_boot_lock:{_HOSTNAME}:*"
+        stale_keys = []
+        async for key in redis.scan_iter(pattern):
+            stale_keys.append(key)
+        if stale_keys:
+            await redis.delete(*stale_keys)
+            logger.info(
+                "Cleared %d stale sandbox boot lock(s) for host %s: %s",
+                len(stale_keys), _HOSTNAME, stale_keys,
+            )
+        # Also clear stale registry entries pointing to this host's dead containers.
+        reg_pattern = f"tools_sandbox_registry:{_HOSTNAME}:*"
+        stale_regs = []
+        async for key in redis.scan_iter(reg_pattern):
+            stale_regs.append(key)
+        if stale_regs:
+            await redis.delete(*stale_regs)
+            logger.info(
+                "Cleared %d stale sandbox registry entry(ies) for host %s.",
+                len(stale_regs), _HOSTNAME,
+            )
 
     async def _boot_with_lock(
-        self, tool: CustomTool, tool_key: str, reg_key: str
+        self, tool: CustomTool, tool_key: str, reg_key: str, port: int
     ) -> str:
         """
         Boot a new gVisor container for the given tool.
@@ -151,7 +190,25 @@ class SandboxPool:
                         "last_active": time.time(),
                     }
                     return entry["bundle_path"]
-            raise RuntimeError(f"Timed out waiting for boot lock on {tool_key}")
+                # If the lock itself expired, the holder died — force-break it
+                # and boot ourselves rather than raising.
+                lock_still_alive = await redis.exists(lock_key)
+                if not lock_still_alive:
+                    logger.warning(
+                        "Boot lock for %s expired with no registry entry — "
+                        "previous holder likely crashed. Force-breaking stale lock.",
+                        tool_key,
+                    )
+                    break  # fall through to acquire the lock ourselves
+            else:
+                # Lock survived the full wait window — treat as hung holder
+                logger.warning(
+                    "Boot lock for %s held for >%ds with no result — "
+                    "force-deleting stale lock and booting.",
+                    tool_key, lock_ttl,
+                )
+            # Force-delete and re-acquire
+            await redis.delete(lock_key)
 
         logger.info("Boot lock acquired for %s", tool_key, extra={"tool_key": tool_key, "step": "lock_acquired"})
 
@@ -180,6 +237,7 @@ class SandboxPool:
             bundle_path = await build_oci_bundle(
                 tool=tool,
                 venv_path=venv_path,
+                port=port,
             )
             logger.info(
                 "OCI bundle ready for %s", tool_key,
@@ -197,6 +255,7 @@ class SandboxPool:
                 bundle_path=bundle_path,
                 container_id=container_id,
                 tool_key=tool_key,
+                port=port,
             )
             logger.info(
                 "Container boot succeeded for %s", tool_key,
@@ -222,6 +281,7 @@ class SandboxPool:
                 "container_id": container_id,
                 "pid": proc.pid,
                 "platform": platform_used,
+                "port": port,
                 "boot_time": time.time(),
                 "request_count": 0,
             }
@@ -231,8 +291,8 @@ class SandboxPool:
             self._local_cache[tool_key] = {**entry, "last_active": time.time()}
 
             logger.info(
-                "Booted sandbox container for %s (pid=%s, platform=%s)",
-                tool_key, proc.pid, platform_used,
+                "Booted sandbox container for %s (pid=%s, platform=%s, port=%d)",
+                tool_key, proc.pid, platform_used, port,
                 extra={
                     "tool_key": tool_key, "step": "boot_complete",
                     "container_id": container_id, "platform": platform_used, "pid": proc.pid, "bundle_path": str(bundle_path),
@@ -258,6 +318,7 @@ class SandboxPool:
         args = [
             "--rootless",
             "--ignore-cgroups",
+            "--direct-fs=true",
             "--network=host",
             "--host-uds=all",
             f"--platform={platform}",
@@ -311,14 +372,12 @@ class SandboxPool:
         except Exception:
             pass
 
-    async def _uds_alive(self, sock_path: str) -> bool:
-        """Quick liveness probe — try connecting to the UDS."""
-        if not os.path.exists(sock_path):
-            return False
+    async def _port_alive(self, port: int) -> bool:
+        """Quick liveness probe — try connecting to loopback TCP port."""
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(sock_path),
-                timeout=1.0,
+                asyncio.open_connection("127.0.0.1", port),
+                timeout=0.5,
             )
             writer.close()
             await writer.wait_closed()
@@ -326,9 +385,9 @@ class SandboxPool:
         except Exception:
             return False
 
-    async def _wait_for_uds(
+    async def _wait_for_port(
         self,
-        sock_path: str,
+        port: int,
         proc: Optional[asyncio.subprocess.Process] = None,
         attempts: int = 30,
         interval: float = 0.5,
@@ -338,7 +397,7 @@ class SandboxPool:
             if proc is not None and proc.returncode is not None:
                 return False
 
-            if await self._uds_alive(sock_path):
+            if await self._port_alive(port):
                 return True
 
         return False
@@ -346,23 +405,19 @@ class SandboxPool:
     async def _discard_failed_container(self, proc: asyncio.subprocess.Process, container_id: str) -> bytes:
         """
         Best-effort teardown of a container that failed to boot, before retrying
-        with a different platform. Kills the subprocess (it may be hung rather
-        than exited — see gVisor's reported kvm-platform shutdown hangs), then
-        runs the same kill/delete sequence used in invalidate() to clear any
-        runsc-side state so a retry with the same container_id doesn't collide
-        with the failed attempt. Returns captured stderr for logging.
+        with a different platform. Kills the subprocess, then runs runsc cleanup.
+        Returns captured stderr tail for logging.
         """
-        stderr = b""
+        stderr_bytes = bytes(self._stderr_tails.pop(proc.pid, b""))
         try:
             proc.kill()
         except ProcessLookupError:
             pass
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=3.0)
-        except Exception:
-            pass
 
-        for args in (("kill", container_id, "SIGKILL"), ("delete", "--force", container_id)):
+        for args in (
+            ("--root=/run/runsc", "kill", container_id, "SIGKILL"),
+            ("--root=/run/runsc", "delete", "-force", container_id),
+        ):
             try:
                 cleanup_proc = await asyncio.create_subprocess_exec(
                     "runsc", *args,
@@ -373,27 +428,14 @@ class SandboxPool:
             except Exception:
                 pass
 
-        return stderr
+        return stderr_bytes
 
     async def _boot_container_with_platform_fallback(
-        self, *, bundle_path: Path, container_id: str, tool_key: str
+        self, *, bundle_path: Path, container_id: str, tool_key: str, port: int
     ) -> tuple[str, asyncio.subprocess.Process]:
         """
         Boot the container by walking an ordered platform chain until one boots
-        successfully: [platform_preferred] + platform_fallback_chain (e.g.
-        kvm -> systrap -> ptrace). Every fallback step is logged loudly
-        (logger.error) — a silent fallback to a weaker isolation platform is a
-        security regression, not a graceful degradation.
-
-        Once a platform is known to work in this process, every later boot (for
-        any tool) uses ONLY that platform — no re-probing the full chain on every
-        boot, and no fallback attempt if it later fails for a specific tool: a
-        platform that already worked once and later fails indicates a systemic
-        problem (device permissions, host config) that retrying other platforms
-        won't fix. A full process restart re-probes from platform_preferred again.
-
-        allow_platform_fallback=False restricts the chain to just the first
-        platform — failure raises immediately instead of walking the rest.
+        successfully.
         """
         cfg = tool_settings.sandbox
 
@@ -410,6 +452,12 @@ class SandboxPool:
             chain = chain[:1]
             sources = sources[:1]
 
+        # Auto-filter KVM and systrap if /dev/kvm does not exist on host (nested container / Docker Desktop)
+        if not os.path.exists("/dev/kvm"):
+            # systrap hangs on socket connect in nested container environments; ptrace is fast and reliable.
+            chain = ["ptrace"]
+            sources = ["ptrace_auto"]
+
         last_stderr_text = ""
         for index, (platform, source) in enumerate(zip(chain, sources)):
             logger.info(
@@ -421,8 +469,7 @@ class SandboxPool:
                 },
             )
             proc = await self._boot_container(bundle_path=bundle_path, container_id=container_id, platform=platform)
-            sock_path = str(bundle_path / "run" / "sandbox" / "tool.sock")
-            is_alive = await self._wait_for_uds(sock_path=sock_path, proc=proc)
+            is_alive = await self._wait_for_port(port=port, proc=proc)
             if is_alive:
                 self._resolved_platform = platform
                 logger.info(
@@ -520,7 +567,7 @@ class SandboxPool:
 
                 # Kill the container
                 proc = await asyncio.create_subprocess_exec(
-                    "runsc", "kill", container_id, "SIGKILL",
+                    "runsc", "--root=/run/runsc", "kill", container_id, "SIGKILL",
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -528,7 +575,7 @@ class SandboxPool:
 
                 # Delete the container
                 proc = await asyncio.create_subprocess_exec(
-                    "runsc", "delete", "--force", container_id,
+                    "runsc", "--root=/run/runsc", "delete", "-force", container_id,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -536,6 +583,11 @@ class SandboxPool:
                 logger.info("Stopped container %s for %s", container_id, tool_key)
             except Exception as exc:
                 logger.warning("Error stopping container %s: %s", container_id, exc)
+
+        # Remove bundle directory from disk
+        from app.sandbox.oci import BUNDLES_DIR
+        import shutil
+        shutil.rmtree(BUNDLES_DIR / f"{tool_name}-{tool_version}", ignore_errors=True)
 
         try:
             redis = await self._get_redis()

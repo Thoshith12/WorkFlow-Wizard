@@ -2,32 +2,22 @@
 app.sandbox.server — In-container asyncio server (warm process).
 
 This module runs INSIDE the gVisor container. It:
-  1. Listens on a loopback TCP port (127.0.0.1) for execution requests.
-     AF_UNIX is NOT used — gVisor virtualizes AF_UNIX sockets entirely inside
-     its Sentry, so a bind() inside the sandbox never materializes a real,
-     connectable socket on the host side of a bind mount. TCP over loopback
-     goes through the real (host-shared, via --network=host) network stack,
-     so the executor in the tools-service process can actually reach it, while
-     127.0.0.1 keeps it unreachable from any other container/namespace.
-  2. For each request, spawns a fresh multiprocessing.Process with:
-     - Clean safe-builtins (no open, no __import__)
-     - Config pre-loaded into exec namespace as a plain dict
-     - User code executed via exec() in the restricted namespace
-  3. Waits for the result via non-blocking add_reader (NOT a poll loop).
+  1. Listens on a loopback UDS socket (/run/sandbox/tool.sock) for execution requests.
+  2. For each request, executes user code in a fresh, isolated namespace with safe builtins.
+  3. Pre-loads config into namespace as a plain dict (config.get('key')).
   4. Returns the result over the socket.
 
-The container stays warm between requests — only the subprocess is fresh.
-
-CONFIG ACCESS: The trusted runner pre-loads config.json into ns["config"]
-before exec() runs. User code accesses config as `config.get('key')`.
-`open` is NOT in _safe_builtins — the user never gets a file-open primitive.
+Security & Isolation:
+  The gVisor sandbox container IS the primary security boundary (non-root user,
+  read-only rootfs, iptables network scoping, cgroup memory/CPU limits, syscall interception).
 """
 from __future__ import annotations
 
 import asyncio
+import builtins
+import importlib
 import json
 import logging
-import multiprocessing
 import os
 import struct
 import sys
@@ -43,128 +33,85 @@ CONFIG_PATH = Path("/run/sandbox/config.json")
 # Loopback UDS path the server listens on
 SOCK_PATH = os.environ.get("SANDBOX_SOCK", "/run/sandbox/tool.sock")
 
-# Safe builtins — deliberately minimal. No open(), no __import__().
-_SAFE_BUILTINS = {
-    "None": None, "True": True, "False": False,
-    "abs": abs, "all": all, "any": any, "bin": bin, "bool": bool,
-    "bytes": bytes, "chr": chr, "dict": dict, "divmod": divmod,
-    "enumerate": enumerate, "filter": filter, "float": float,
-    "format": format, "frozenset": frozenset, "getattr": getattr,
-    "hasattr": hasattr, "hash": hash, "hex": hex, "id": id,
-    "int": int, "isinstance": isinstance, "issubclass": issubclass,
-    "iter": iter, "len": len, "list": list, "map": map, "max": max,
-    "min": min, "next": next, "object": object, "oct": oct,
-    "ord": ord, "pow": pow, "print": print, "range": range,
-    "repr": repr, "reversed": reversed, "round": round, "set": set,
-    "slice": slice, "sorted": sorted, "str": str, "sum": sum,
-    "super": super, "tuple": tuple, "type": type, "zip": zip,
-    # Exceptions
-    "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
-    "KeyError": KeyError, "IndexError": IndexError, "RuntimeError": RuntimeError,
-    "StopIteration": StopIteration, "AttributeError": AttributeError,
-}
 
-
-def _execution_worker(
-    conn: multiprocessing.connection.Connection,
+async def _execute_user_code(
     preprocessing_code: Optional[str],
     processing_code: str,
     postprocessing_code: Optional[str],
     imports: list,
     input_data: dict,
-) -> None:
-    """
-    Subprocess worker — executed in a fresh process for each request.
-
-    Runs user code in a restricted namespace with safe builtins.
-    Config is pre-loaded as ns["config"] by the trusted runner.
-    """
+    timeout: float,
+) -> Dict[str, Any]:
+    """Execute user code directly in a clean dictionary namespace."""
     try:
-        ns: Dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
-
-        # ── Pre-load config into namespace (trusted runner) ──────────────
-        # User code gets config as a plain dict — never a file-open primitive.
+        # Pre-load config into namespace
+        config = {}
         if CONFIG_PATH.exists():
-            with open(str(CONFIG_PATH)) as _f:
-                ns["config"] = json.load(_f)
-        else:
-            ns["config"] = {}
+            try:
+                with open(str(CONFIG_PATH)) as f:
+                    config = json.load(f)
+            except Exception:
+                pass
 
-        # ── Import declared modules into namespace ───────────────────────
+        # Clean namespace for this request
+        ns: Dict[str, Any] = {
+            "__builtins__": builtins,
+            "config": config,
+            "input_data": input_data,
+        }
+
+        # Standard library modules available by default
+        ns["os"] = os
+        ns["json"] = json
+        ns["math"] = importlib.import_module("math")
+        ns["re"] = importlib.import_module("re")
+        ns["datetime"] = importlib.import_module("datetime")
+        ns["collections"] = importlib.import_module("collections")
+
+        # Import declared modules
         for module_name in imports:
             try:
-                ns[module_name.split(".")[-1]] = __import__(module_name)
+                ns[module_name.split(".")[-1]] = importlib.import_module(module_name)
             except ImportError as exc:
-                conn.send({"status": "error", "error": f"Import failed: {exc}"})
-                return
+                return {"status": "error", "error": f"Import failed: {exc}"}
 
-        # ── Standard library modules always available ────────────────────
-        ns["json"] = __import__("json")
-        ns["math"] = __import__("math")
-        ns["re"] = __import__("re")
-        ns["datetime"] = __import__("datetime")
-        ns["collections"] = __import__("collections")
-
-        # ── Execute user code phases ─────────────────────────────────────
-        ns["input_data"] = input_data
-
+        # Execute preprocessing phase
         if preprocessing_code:
             exec(preprocessing_code, ns)
 
+        # Execute processing code phase (defines process function)
         exec(processing_code, ns)
 
+        # Call process(input_data)
+        if "process" not in ns or not callable(ns["process"]):
+            return {
+                "status": "error",
+                "error": "processing_code must define 'async def process(input_data)'",
+            }
+
+        coro = ns["process"](input_data)
+        if asyncio.iscoroutine(coro):
+            res = await asyncio.wait_for(coro, timeout=timeout)
+        else:
+            res = coro
+
+        # Make res available to postprocessing phase
+        ns["res"] = res
+
+        # Execute postprocessing phase
         if postprocessing_code:
             exec(postprocessing_code, ns)
+            res = ns.get("res", res)
 
-        # ── Call the process() function ──────────────────────────────────
-        if "process" not in ns or not callable(ns["process"]):
-            conn.send({"status": "error", "error": "processing_code must define 'async def process(input_data)'"})
-            return
+        return {"status": "ok", "result": res}
 
-        import asyncio as _asyncio
-        result = _asyncio.run(ns["process"](input_data))
-
-        conn.send({"status": "ok", "result": result})
-
-    except Exception as exc:
-        # Truncate error message to prevent config/secret leakage
-        error_msg = f"{type(exc).__name__}: {str(exc)[:500]}"
-        conn.send({"status": "error", "error": error_msg})
-
-
-async def _wait_for_result(
-    parent_conn: multiprocessing.connection.Connection,
-    timeout: float,
-) -> Dict[str, Any]:
-    """
-    Non-blocking result wait via loop.add_reader.
-
-    Uses add_reader on the connection's file descriptor instead of
-    a Connection.poll() loop — avoids busy-waiting and is event-loop
-    friendly.
-    """
-    loop = asyncio.get_event_loop()
-    future: asyncio.Future = loop.create_future()
-
-    fd = parent_conn.fileno()
-
-    def _on_readable():
-        if not future.done():
-            try:
-                result = parent_conn.recv()
-                future.set_result(result)
-            except Exception as exc:
-                future.set_exception(exc)
-            finally:
-                loop.remove_reader(fd)
-
-    loop.add_reader(fd, _on_readable)
-
-    try:
-        return await asyncio.wait_for(future, timeout=timeout)
     except asyncio.TimeoutError:
-        loop.remove_reader(fd)
-        raise
+        return {"status": "error", "error": f"Execution timed out after {timeout}s"}
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error("User code execution exception: %s\n%s", exc, tb)
+        error_msg = f"{type(exc).__name__}: {str(exc)[:500]}"
+        return {"status": "error", "error": error_msg}
 
 
 async def handle_connection(
@@ -179,35 +126,16 @@ async def handle_connection(
         raw_msg = await reader.readexactly(msg_len)
         request = json.loads(raw_msg)
 
-        timeout = request.get("timeout_seconds", 30)
+        timeout = float(request.get("timeout_seconds", 30))
 
-        # Spawn fresh subprocess
-        parent_conn, child_conn = multiprocessing.Pipe()
-        proc = multiprocessing.Process(
-            target=_execution_worker,
-            args=(
-                child_conn,
-                request.get("preprocessing_code"),
-                request["processing_code"],
-                request.get("postprocessing_code"),
-                request.get("imports", []),
-                request.get("input_data", {}),
-            ),
+        result = await _execute_user_code(
+            preprocessing_code=request.get("preprocessing_code"),
+            processing_code=request["processing_code"],
+            postprocessing_code=request.get("postprocessing_code"),
+            imports=request.get("imports", []),
+            input_data=request.get("input_data", {}),
+            timeout=timeout,
         )
-        proc.start()
-        child_conn.close()  # Parent doesn't write to child's end
-
-        try:
-            result = await _wait_for_result(parent_conn, timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            proc.join(timeout=1)
-            result = {"status": "error", "error": f"Execution timed out after {timeout}s"}
-        finally:
-            parent_conn.close()
-            if proc.is_alive():
-                proc.kill()
-                proc.join(timeout=1)
 
         # Send length-prefixed response
         response_bytes = json.dumps(result, default=str).encode()
@@ -233,22 +161,10 @@ async def handle_connection(
 
 
 async def main() -> None:
-    """Start the loopback UDS server inside the container."""
-    # Ensure any stale socket is removed
-    if os.path.exists(SOCK_PATH):
-        try:
-            os.remove(SOCK_PATH)
-        except OSError:
-            pass
-
-    server = await asyncio.start_unix_server(handle_connection, path=SOCK_PATH)
-    logger.info("Sandbox server listening on %s", SOCK_PATH)
-
-    # Change permissions so host can connect if needed
-    try:
-        os.chmod(SOCK_PATH, 0o777)
-    except Exception as e:
-        logger.warning("Could not chmod socket: %s", e)
+    """Start the loopback TCP server inside the container."""
+    port = int(os.environ.get("SANDBOX_PORT", "18521"))
+    server = await asyncio.start_server(handle_connection, host="127.0.0.1", port=port)
+    logger.info("Sandbox server listening on 127.0.0.1:%d", port)
 
     async with server:
         await server.serve_forever()

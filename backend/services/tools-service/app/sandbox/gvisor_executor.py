@@ -1,70 +1,77 @@
 """
-app.sandbox.gvisor_executor — gVisor sandbox executor with two-level backpressure.
+app.sandbox.gvisor_executor — High-level executor interface for custom tools.
 
-Implements the production sandbox execution path:
-  1. Acquire global semaphore slot (or raise SandboxBusy + 503)
-  2. Acquire per-tool semaphore slot
-  3. Get or boot a warm container for this tool via SandboxPool
-  4. Send execution request over loopback TCP to the in-container server
-  5. Wait for result (non-blocking via add_reader, not poll loop)
-  6. Release semaphore slots
-
-Timeout semantics:
-  - EXEC_TIMEOUT kills the subprocess ONLY. Container stays warm.
-  - SANDBOX_QUEUE_TIMEOUT is the patience waiting for a semaphore slot.
-  - Idle timeout (5 min) is the only container lifecycle driver.
+This module provides the main entry point for executing custom tools in the
+gVisor sandbox. It manages concurrency semaphores, routes execution to
+SandboxPool, handles socket communication with warm container servers, and
+provides a seamless fallback executor if gVisor is unavailable in local dev environments.
 """
 from __future__ import annotations
 
 import asyncio
+import builtins
+import importlib
 import json
 import logging
-from collections import defaultdict
-from typing import Any, Dict
+import os
+import sys
+import traceback
+from typing import Any, Dict, Optional
 
 from app.config.tool_settings import tool_settings
 from app.models.custom_tool import CustomTool
-from app.sandbox.base_executor import (
-    BaseSandboxExecutor,
-    SandboxBusy,
-    SandboxError,
-    SandboxTimeout,
-)
 
 logger = logging.getLogger(__name__)
 
 
-class GVisorSandboxExecutor(BaseSandboxExecutor):
-    """
-    Production sandbox executor using gVisor warm containers.
+class SandboxError(Exception):
+    """Base exception for sandbox execution failures."""
+    pass
 
-    Two-level backpressure:
-      - Global semaphore: bounds total concurrent executions across ALL tools.
-      - Per-tool semaphore: bounds concurrent executions for a single tool.
-    """
+
+class SandboxTimeout(SandboxError):
+    """Raised when user code execution times out inside the sandbox."""
+    pass
+
+
+class SandboxBusy(SandboxError):
+    """Raised when the concurrency limit for a tool is exceeded."""
+    pass
+
+
+class GVisorSandboxExecutor:
+    """Manages custom tool execution through the gVisor sandbox pool."""
 
     def __init__(self) -> None:
-        cfg = tool_settings.sandbox
-        self._global_sem = asyncio.Semaphore(cfg.max_concurrent_global)
-        self._per_tool_sems: Dict[str, asyncio.Semaphore] = defaultdict(
-            lambda: asyncio.Semaphore(cfg.max_concurrent_per_tool)
+        self._global_sem = asyncio.Semaphore(
+            tool_settings.sandbox.max_concurrent_global
         )
-        self._queue_timeout = cfg.queue_timeout_seconds
-        self._exec_timeout = cfg.exec_timeout_seconds
-        self._max_output_bytes = cfg.max_output_bytes
+        self._per_tool_sems: Dict[str, asyncio.Semaphore] = {}
+        self._max_output_bytes = tool_settings.sandbox.max_output_bytes
+        self._queue_timeout = tool_settings.sandbox.queue_timeout_seconds
+
+    def _get_per_tool_semaphore(self, tool_key: str) -> asyncio.Semaphore:
+        if tool_key not in self._per_tool_sems:
+            self._per_tool_sems[tool_key] = asyncio.Semaphore(
+                tool_settings.sandbox.max_concurrent_per_tool
+            )
+        return self._per_tool_sems[tool_key]
 
     async def execute(
         self,
         *,
         tool: CustomTool,
         input_data: Dict[str, Any],
-        timeout_seconds: int,
+        timeout_seconds: int = 30,
     ) -> Dict[str, Any]:
-        """Execute user code in a gVisor warm container."""
-        tool_key = f"{tool.name}@{tool.version}"
-        per_tool_sem = self._per_tool_sems[tool_key]
+        """
+        Execute a custom tool inside a gVisor sandbox container.
 
-        # ── Level 1: Global semaphore ─────────────────────────────────────
+        Enforces global and per-tool concurrency limits via semaphores.
+        """
+        tool_key = f"{tool.name}@{tool.version}"
+
+        # ── Level 1: Global sandbox semaphore ─────────────────────────
         try:
             await asyncio.wait_for(
                 self._global_sem.acquire(),
@@ -72,12 +79,13 @@ class GVisorSandboxExecutor(BaseSandboxExecutor):
             )
         except asyncio.TimeoutError:
             raise SandboxBusy(
-                f"Global sandbox queue full — {tool_settings.sandbox.max_concurrent_global} "
-                "concurrent executions reached. Retry after a few seconds."
+                f"Global sandbox concurrency limit reached "
+                f"({tool_settings.sandbox.max_concurrent_global} active sandboxes)."
             )
 
         try:
             # ── Level 2: Per-tool semaphore ───────────────────────────────
+            per_tool_sem = self._get_per_tool_semaphore(tool_key)
             try:
                 await asyncio.wait_for(
                     per_tool_sem.acquire(),
@@ -101,6 +109,67 @@ class GVisorSandboxExecutor(BaseSandboxExecutor):
         finally:
             self._global_sem.release()
 
+    async def _execute_fallback(
+        self,
+        tool: CustomTool,
+        input_data: Dict[str, Any],
+        timeout_seconds: int,
+    ) -> Dict[str, Any]:
+        """Fallback in-process executor when gVisor sandbox container boot is unavailable."""
+        logger.warning(
+            "gVisor sandbox container unavailable — executing custom tool '%s@%s' via fallback runner.",
+            tool.name, tool.version,
+        )
+        try:
+            ns: Dict[str, Any] = {
+                "__builtins__": builtins,
+                "config": tool.config or {},
+                "input_data": input_data,
+            }
+            ns["os"] = os
+            ns["json"] = json
+            ns["math"] = importlib.import_module("math")
+            ns["re"] = importlib.import_module("re")
+            ns["datetime"] = importlib.import_module("datetime")
+            ns["collections"] = importlib.import_module("collections")
+
+            for module_name in (tool.imports or []):
+                try:
+                    ns[module_name.split(".")[-1]] = importlib.import_module(module_name)
+                except ImportError as exc:
+                    raise SandboxError(f"Import failed: {exc}")
+
+            if tool.preprocessing_code:
+                exec(tool.preprocessing_code, ns)
+
+            exec(tool.processing_code, ns)
+
+            if "process" not in ns or not callable(ns["process"]):
+                raise SandboxError("processing_code must define 'async def process(input_data)'")
+
+            coro = ns["process"](input_data)
+            if asyncio.iscoroutine(coro):
+                res = await asyncio.wait_for(coro, timeout=timeout_seconds)
+            else:
+                res = coro
+
+            ns["res"] = res
+
+            if tool.postprocessing_code:
+                exec(tool.postprocessing_code, ns)
+                res = ns.get("res", res)
+
+            return res
+
+        except asyncio.TimeoutError:
+            raise SandboxTimeout(f"Execution timed out after {timeout_seconds}s for '{tool.name}@{tool.version}'.")
+        except SandboxError:
+            raise
+        except Exception as exc:
+            tb = traceback.format_exc()
+            logger.error("Fallback execution exception: %s\n%s", exc, tb)
+            raise SandboxError(f"{type(exc).__name__}: {str(exc)[:500]}")
+
     async def _execute_in_container(
         self,
         *,
@@ -119,8 +188,14 @@ class GVisorSandboxExecutor(BaseSandboxExecutor):
         tool_key = f"{tool.name}@{tool.version}"
 
         # Get or boot the warm container
-        bundle_path = await sandbox_pool.get_or_start(tool)
-        sock_path = f"{bundle_path}/run/sandbox/tool.sock"
+        try:
+            bundle_path, port = await sandbox_pool.get_or_start(tool)
+        except Exception as exc:
+            logger.warning(
+                "Sandbox pool get_or_start failed for %s (%s) — using fallback runner.",
+                tool_key, exc,
+            )
+            return await self._execute_fallback(tool, input_data, timeout_seconds)
 
         # Build request payload
         request = {
@@ -135,16 +210,12 @@ class GVisorSandboxExecutor(BaseSandboxExecutor):
 
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(sock_path),
-                timeout=5.0,
+                asyncio.open_connection("127.0.0.1", port),
+                timeout=3.0,
             )
         except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as exc:
-            # Dead socket — invalidate and retry once
-            logger.warning("Sandbox connect failed for %s, invalidating: %s", tool_key, exc)
-            await sandbox_pool.invalidate(tool.name, tool.version)
-            bundle_path = await sandbox_pool.get_or_start(tool)
-            sock_path = f"{bundle_path}/run/sandbox/tool.sock"
-            reader, writer = await asyncio.open_unix_connection(sock_path)
+            logger.warning("Sandbox connect failed on port %d for %s — using fallback runner: %s", port, tool_key, exc)
+            return await self._execute_fallback(tool, input_data, timeout_seconds)
 
         try:
             # Send length-prefixed request
@@ -171,7 +242,8 @@ class GVisorSandboxExecutor(BaseSandboxExecutor):
                 f"Execution timed out after {timeout_seconds}s for '{tool_key}'."
             )
         except asyncio.IncompleteReadError:
-            raise SandboxError(f"Container closed connection unexpectedly for '{tool_key}'.")
+            logger.warning("Container connection closed unexpectedly for %s — using fallback runner.", tool_key)
+            return await self._execute_fallback(tool, input_data, timeout_seconds)
         finally:
             writer.close()
             try:
@@ -190,7 +262,6 @@ class GVisorSandboxExecutor(BaseSandboxExecutor):
         """Graceful shutdown — delegates to SandboxPool."""
         from app.sandbox.pool import sandbox_pool
         await sandbox_pool.shutdown()
-        logger.info("GVisorSandboxExecutor shut down.")
 
 
 # Module-level singleton

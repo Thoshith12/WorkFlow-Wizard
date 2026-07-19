@@ -29,6 +29,7 @@ BUNDLES_DIR = Path("/tmp/tool-bundles")
 async def build_oci_bundle(
     tool: CustomTool,
     venv_path: Path,
+    port: int,
 ) -> Path:
     """
     Build an OCI bundle directory for the given tool.
@@ -81,7 +82,7 @@ async def build_oci_bundle(
                 # Extra pip packages from the per-tool venv (site-packages only —
                 # the venv supplies no interpreter of its own in this design).
                 "PYTHONPATH=/opt/venv/lib/python3.11/site-packages",
-                "SANDBOX_SOCK=/run/sandbox/tool.sock",
+                f"SANDBOX_PORT={port}",
                 "PYTHONDONTWRITEBYTECODE=1",
                 "PYTHONUNBUFFERED=1",
             ],
