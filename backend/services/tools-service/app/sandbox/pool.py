@@ -95,22 +95,9 @@ class SandboxPool:
             else:
                 logger.warning("Dead sandbox server port %d for %s, invalidating.", port, tool_key)
                 await self.invalidate(tool.name, tool.version)
-
-        # Check Redis registry
-        redis = await self._get_redis()
-        entry_raw = await redis.get(reg_key)
-        if entry_raw:
-            entry = json.loads(entry_raw)
-            bundle_path = entry["bundle_path"]
-            if await self._port_alive(port):
-                self._local_cache[tool_key] = {
-                    "last_active": time.time(),
-                    **entry,
-                }
-                return bundle_path, port
-            else:
-                logger.warning("Dead sandbox server port %d in Redis for %s, invalidating.", port, tool_key)
-                await self._cleanup_entry(tool_key, reg_key)
+        if cached and cached.get("proc") and cached["proc"].returncode is None:
+            cached["last_active"] = time.time()
+            return cached["bundle_path"], cached["proc"]
 
         # Boot new container (with lock to prevent double-boot)
         if tool_key not in self._boot_locks:
@@ -119,13 +106,11 @@ class SandboxPool:
         async with self._boot_locks[tool_key]:
             # Double-check after acquiring lock
             cached = self._local_cache.get(tool_key)
-            if cached:
-                bundle_path = cached["bundle_path"]
-                if await self._port_alive(port):
-                    return bundle_path, port
+            if cached and cached.get("proc") and cached["proc"].returncode is None:
+                return cached["bundle_path"], cached["proc"]
 
-            bundle_path = await self._boot_with_lock(tool, tool_key, reg_key, port)
-            return bundle_path, port
+            bundle_path, proc = await self._boot_with_lock(tool, tool_key, reg_key, port)
+            return bundle_path, proc
 
     async def clear_stale_locks(self) -> None:
         """
@@ -288,7 +273,7 @@ class SandboxPool:
             await redis.set(reg_key, json.dumps(entry), ex=tool_settings.sandbox.max_lifetime_seconds)
 
             # Update local cache
-            self._local_cache[tool_key] = {**entry, "last_active": time.time()}
+            self._local_cache[tool_key] = {**entry, "proc": proc, "last_active": time.time()}
 
             logger.info(
                 "Booted sandbox container for %s (pid=%s, platform=%s, port=%d)",
@@ -298,7 +283,7 @@ class SandboxPool:
                     "container_id": container_id, "platform": platform_used, "pid": proc.pid, "bundle_path": str(bundle_path),
                 },
             )
-            return str(bundle_path)
+            return str(bundle_path), proc
 
         finally:
             heartbeat_task.cancel()
@@ -318,7 +303,6 @@ class SandboxPool:
         args = [
             "--rootless",
             "--ignore-cgroups",
-            "--direct-fs=true",
             "--network=host",
             "--host-uds=all",
             f"--platform={platform}",
@@ -346,12 +330,12 @@ class SandboxPool:
             "run",
             "--bundle", str(bundle_path),
             container_id,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stderr_tail = bytearray()
         self._stderr_tails[proc.pid] = stderr_tail
-        asyncio.create_task(self._drain_stream(proc.stdout, bytearray()))
         asyncio.create_task(self._drain_stream(proc.stderr, stderr_tail))
         return proc
 
@@ -469,7 +453,8 @@ class SandboxPool:
                 },
             )
             proc = await self._boot_container(bundle_path=bundle_path, container_id=container_id, platform=platform)
-            is_alive = await self._wait_for_port(port=port, proc=proc)
+            await asyncio.sleep(0.3)
+            is_alive = proc.returncode is None
             if is_alive:
                 self._resolved_platform = platform
                 logger.info(
@@ -534,7 +519,34 @@ class SandboxPool:
         except asyncio.CancelledError:
             pass
 
-    # Removed _port_alive
+    async def _port_alive(self, port: int) -> bool:
+        """Check if TCP port is accepting connections."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port),
+                timeout=0.2,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
+            return False
+
+    async def _wait_for_port(
+        self, *, port: int, proc: asyncio.subprocess.Process, timeout: float = 5.0
+    ) -> bool:
+        """Poll port for up to timeout seconds while verifying proc is alive."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if proc.returncode is not None:
+                return False
+            if await self._port_alive(port):
+                return True
+            await asyncio.sleep(0.05)
+        return False
 
     async def _cleanup_entry(self, tool_key: str, reg_key: str) -> None:
         """Remove a dead entry from both local cache and Redis."""

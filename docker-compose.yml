@@ -227,11 +227,13 @@ services:
       - KEYCLOAK_SERVER_URL=http://keycloak:8080/
       # environment: takes precedence over env_file for the same key, so a
       # shell-exported override works without editing .env's committed default.
+      - SANDBOX_MODE=${SANDBOX_MODE:-gvisor}
       - SANDBOX_UNSAFE_NESTED_DEV=${SANDBOX_UNSAFE_NESTED_DEV:-false}
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
       - SYS_CHROOT
+      - SYS_PTRACE
     security_opt:
       - seccomp:unconfined
     # gVisor's chroot setup needs /tmp to be its own mount (pivot_root requires

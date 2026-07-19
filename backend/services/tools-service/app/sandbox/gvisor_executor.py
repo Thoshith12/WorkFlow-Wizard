@@ -71,6 +71,9 @@ class GVisorSandboxExecutor:
         """
         tool_key = f"{tool.name}@{tool.version}"
 
+        if tool_settings.sandbox.mode == "none":
+            return await self._execute_fallback(tool, input_data, timeout_seconds)
+
         # ── Level 1: Global sandbox semaphore ─────────────────────────
         try:
             await asyncio.wait_for(
@@ -178,10 +181,7 @@ class GVisorSandboxExecutor:
         timeout_seconds: int,
     ) -> Dict[str, Any]:
         """
-        Send an execution request to the warm container's loopback TCP server.
-
-        Gets the port from the SandboxPool (which handles boot-on-miss,
-        liveness checks, and dead-port recovery).
+        Send an execution request to the warm container process via stdio pipe IPC.
         """
         from app.sandbox.pool import sandbox_pool
 
@@ -189,7 +189,7 @@ class GVisorSandboxExecutor:
 
         # Get or boot the warm container
         try:
-            bundle_path, port = await sandbox_pool.get_or_start(tool)
+            bundle_path, proc = await sandbox_pool.get_or_start(tool)
         except Exception as exc:
             logger.warning(
                 "Sandbox pool get_or_start failed for %s (%s) — using fallback runner.",
@@ -209,22 +209,16 @@ class GVisorSandboxExecutor:
         request_bytes = json.dumps(request).encode()
 
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", port),
-                timeout=3.0,
+            # Write length-prefixed request to container stdin
+            proc.stdin.write(len(request_bytes).to_bytes(4, "big"))
+            proc.stdin.write(request_bytes)
+            await proc.stdin.drain()
+
+            # Read length-prefixed response from container stdout
+            raw_len = await asyncio.wait_for(
+                proc.stdout.readexactly(4),
+                timeout=float(timeout_seconds),
             )
-        except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as exc:
-            logger.warning("Sandbox connect failed on port %d for %s — using fallback runner: %s", port, tool_key, exc)
-            return await self._execute_fallback(tool, input_data, timeout_seconds)
-
-        try:
-            # Send length-prefixed request
-            writer.write(len(request_bytes).to_bytes(4, "big"))
-            writer.write(request_bytes)
-            await writer.drain()
-
-            # Read length-prefixed response (non-blocking)
-            raw_len = await asyncio.wait_for(reader.readexactly(4), timeout=timeout_seconds)
             response_len = int.from_bytes(raw_len, "big")
 
             if response_len > self._max_output_bytes:
@@ -234,29 +228,19 @@ class GVisorSandboxExecutor:
                 )
 
             raw_response = await asyncio.wait_for(
-                reader.readexactly(response_len),
-                timeout=timeout_seconds,
+                proc.stdout.readexactly(response_len),
+                timeout=float(timeout_seconds),
             )
-        except asyncio.TimeoutError:
-            raise SandboxTimeout(
-                f"Execution timed out after {timeout_seconds}s for '{tool_key}'."
-            )
-        except asyncio.IncompleteReadError:
-            logger.warning("Container connection closed unexpectedly for %s — using fallback runner.", tool_key)
+
+            response = json.loads(raw_response)
+            if response.get("status") == "error":
+                raise SandboxError(response.get("error", "Unknown sandbox error"))
+
+            return response.get("result", {})
+
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, OSError) as exc:
+            logger.warning("Container stdio communication failed for %s — using fallback runner: %s", tool_key, exc)
             return await self._execute_fallback(tool, input_data, timeout_seconds)
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-        response = json.loads(raw_response)
-
-        if response.get("status") == "error":
-            raise SandboxError(response.get("error", "Unknown sandbox error"))
-
-        return response.get("result", {})
 
     async def shutdown(self) -> None:
         """Graceful shutdown — delegates to SandboxPool."""
