@@ -73,7 +73,7 @@ async def build_oci_bundle(
         "ociVersion": "1.0.0",
         "process": {
             "terminal": False,
-            "user": {"uid": 65534, "gid": 65534},  # nobody
+            "user": {"uid": cfg.sandbox_uid, "gid": cfg.sandbox_gid},  # nobody
             "args": [
                 "python3", "-u", "/run/sandbox/server.py",
             ],

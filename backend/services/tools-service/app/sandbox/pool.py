@@ -38,6 +38,11 @@ class SandboxPool:
     def __init__(self) -> None:
         self._local_cache: Dict[str, Dict[str, Any]] = {}
         self._boot_locks: Dict[str, asyncio.Lock] = {}
+        # Sticky for this process's lifetime once a platform successfully boots a
+        # container — avoids re-attempting a known-failing preferred platform (e.g.
+        # kvm) on every single container boot. Cleared only by a process restart,
+        # which re-probes from tool_settings.sandbox.platform_preferred again.
+        self._resolved_platform: Optional[str] = None
 
     def _registry_key(self, tool_name: str, tool_version: str) -> str:
         """Host-scoped Redis key for horizontal scaling."""
@@ -152,27 +157,17 @@ class SandboxPool:
                 venv_path=venv_path,
             )
 
-            # Start gVisor container
+            # Start gVisor container (falls back to a secondary platform if the
+            # preferred one fails to boot — see _boot_container_with_platform_fallback)
             from app.sandbox.netfilter import apply_iptables_rules
             container_id = f"tool-sandbox-{tool.name}-{tool.version}-{_HOSTNAME}"
 
-            proc = await asyncio.create_subprocess_exec(
-                "runsc", "run",
-                "--rootless",
-                "--network=host",
-                "--bundle", str(bundle_path),
-                container_id,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            platform_used, proc = await self._boot_container_with_platform_fallback(
+                bundle_path=bundle_path,
+                socket_path=socket_path,
+                container_id=container_id,
+                tool_key=tool_key,
             )
-
-            # Wait for the socket to become available
-            for attempt in range(30):
-                await asyncio.sleep(0.5)
-                if await self._socket_alive(socket_path):
-                    break
-            else:
-                raise RuntimeError(f"Container socket never became available: {tool_key}")
 
             # Apply iptables rules for network isolation
             await apply_iptables_rules(container_id)
@@ -182,6 +177,7 @@ class SandboxPool:
                 "socket_path": str(socket_path),
                 "container_id": container_id,
                 "pid": proc.pid,
+                "platform": platform_used,
                 "boot_time": time.time(),
                 "request_count": 0,
             }
@@ -190,12 +186,123 @@ class SandboxPool:
             # Update local cache
             self._local_cache[tool_key] = {**entry, "last_active": time.time()}
 
-            logger.info("Booted sandbox container for %s (pid=%s)", tool_key, proc.pid)
+            logger.info(
+                "Booted sandbox container for %s (pid=%s, platform=%s)",
+                tool_key, proc.pid, platform_used,
+            )
             return str(socket_path)
 
         finally:
             heartbeat_task.cancel()
             await redis.delete(lock_key)
+
+    async def _boot_container(
+        self, *, bundle_path, container_id: str, platform: str
+    ) -> asyncio.subprocess.Process:
+        """Start `runsc run` for one platform. Caller waits for socket liveness."""
+        return await asyncio.create_subprocess_exec(
+            "runsc", "run",
+            "--rootless",
+            "--network=host",
+            f"--platform={platform}",
+            "--bundle", str(bundle_path),
+            container_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    async def _wait_for_socket(self, socket_path, attempts: int = 30, interval: float = 0.5) -> bool:
+        for _ in range(attempts):
+            await asyncio.sleep(interval)
+            if await self._socket_alive(socket_path):
+                return True
+        return False
+
+    async def _discard_failed_container(self, proc: asyncio.subprocess.Process, container_id: str) -> bytes:
+        """
+        Best-effort teardown of a container that failed to boot, before retrying
+        with a different platform. Kills the subprocess (it may be hung rather
+        than exited — see gVisor's reported kvm-platform shutdown hangs), then
+        runs the same kill/delete sequence used in invalidate() to clear any
+        runsc-side state so a retry with the same container_id doesn't collide
+        with the failed attempt. Returns captured stderr for logging.
+        """
+        stderr = b""
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+        except Exception:
+            pass
+
+        for args in (("kill", container_id, "SIGKILL"), ("delete", "--force", container_id)):
+            try:
+                cleanup_proc = await asyncio.create_subprocess_exec(
+                    "runsc", *args,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await cleanup_proc.wait()
+            except Exception:
+                pass
+
+        return stderr
+
+    async def _boot_container_with_platform_fallback(
+        self, *, bundle_path, socket_path, container_id: str, tool_key: str
+    ) -> tuple[str, asyncio.subprocess.Process]:
+        """
+        Boot the container on the resolved (or preferred) sandbox platform. If
+        this process hasn't resolved a working platform yet and the preferred
+        one fails to boot, falls back once to SANDBOX_PLATFORM_FALLBACK — loudly
+        logged, since a silent fallback to a weaker isolation platform is a
+        security regression, not a graceful degradation.
+
+        Once a platform is known to work in this process, every later boot (for
+        any tool) uses it directly — no re-probing the preferred platform on
+        every single boot, and no per-boot fallback retry after that: a platform
+        that already worked once and later fails to boot for a specific tool
+        indicates a systemic problem (device permissions, host config) that an
+        in-process retry won't fix anyway. A full process restart re-probes from
+        platform_preferred again.
+        """
+        cfg = tool_settings.sandbox
+        platform = self._resolved_platform or cfg.platform_preferred
+
+        proc = await self._boot_container(bundle_path=bundle_path, container_id=container_id, platform=platform)
+        if await self._wait_for_socket(socket_path):
+            self._resolved_platform = platform
+            return platform, proc
+
+        stderr = await self._discard_failed_container(proc, container_id)
+
+        if self._resolved_platform is not None or not cfg.allow_platform_fallback or platform == cfg.platform_fallback:
+            raise RuntimeError(
+                f"Sandbox container for {tool_key} failed to boot on platform '{platform}' "
+                f"and no fallback is available (allow_platform_fallback={cfg.allow_platform_fallback}). "
+                f"stderr: {stderr.decode(errors='replace')[:500]}"
+            )
+
+        logger.error(
+            "Sandbox platform '%s' failed to boot container for %s — falling back to '%s'. "
+            "Isolation for this process is now running on the fallback platform; investigate "
+            "why '%s' failed before relying on it again. stderr: %s",
+            platform, tool_key, cfg.platform_fallback, platform, stderr.decode(errors="replace")[:500],
+        )
+
+        proc = await self._boot_container(bundle_path=bundle_path, container_id=container_id, platform=cfg.platform_fallback)
+        if not await self._wait_for_socket(socket_path):
+            fallback_stderr = await self._discard_failed_container(proc, container_id)
+            raise RuntimeError(
+                f"Sandbox container for {tool_key} failed to boot on both preferred platform "
+                f"'{platform}' and fallback platform '{cfg.platform_fallback}'. "
+                f"stderr: {fallback_stderr.decode(errors='replace')[:500]}"
+            )
+
+        self._resolved_platform = cfg.platform_fallback
+        return cfg.platform_fallback, proc
 
     async def _lock_heartbeat(self, redis, lock_key: str, ttl: int) -> None:
         """

@@ -30,6 +30,20 @@ class SandboxConfig:
     pids_limit: int = 16
     cpu_quota_percent: int = 300  # 300% = 3 cores max
 
+    # Sandboxed process identity — single source of truth shared by oci.py
+    # (container process uid/gid) and netfilter.py (iptables -m owner scoping).
+    sandbox_uid: int = 65534  # nobody
+    sandbox_gid: int = 65534  # nobody
+
+    # gVisor syscall-interception platform. Preferred is attempted first on a
+    # container's first boot in this process; if it fails, pool.py falls back
+    # once to `platform_fallback` and stays on whatever worked for the rest
+    # of the process's lifetime. Set allow_platform_fallback=False to have
+    # boot fail hard instead of silently running on a weaker platform.
+    platform_preferred: Literal["ptrace", "systrap", "kvm"] = "systrap"
+    platform_fallback: Literal["ptrace", "systrap", "kvm"] = "systrap"
+    allow_platform_fallback: bool = True
+
     # Per-subprocess execution timeout — kills the subprocess ONLY, not the container.
     exec_timeout_seconds: int = 30
 
@@ -67,6 +81,11 @@ class ToolSettings(BaseSettings):
     SANDBOX_MEMORY_MB: int = Field(default=256)
     SANDBOX_PIDS_LIMIT: int = Field(default=16)
     SANDBOX_CPU_QUOTA_PERCENT: int = Field(default=300)
+    SANDBOX_UID: int = Field(default=65534)
+    SANDBOX_GID: int = Field(default=65534)
+    SANDBOX_PLATFORM_PREFERRED: Literal["ptrace", "systrap", "kvm"] = Field(default="systrap")
+    SANDBOX_PLATFORM_FALLBACK: Literal["ptrace", "systrap", "kvm"] = Field(default="systrap")
+    SANDBOX_ALLOW_PLATFORM_FALLBACK: bool = Field(default=True)
     SANDBOX_EXEC_TIMEOUT_SECONDS: int = Field(default=30)
     SANDBOX_QUEUE_TIMEOUT_SECONDS: int = Field(default=15)
     SANDBOX_MAX_INFLIGHT: int = Field(default=10)
@@ -96,6 +115,11 @@ class ToolSettings(BaseSettings):
             memory_mb=self.SANDBOX_MEMORY_MB,
             pids_limit=self.SANDBOX_PIDS_LIMIT,
             cpu_quota_percent=self.SANDBOX_CPU_QUOTA_PERCENT,
+            sandbox_uid=self.SANDBOX_UID,
+            sandbox_gid=self.SANDBOX_GID,
+            platform_preferred=self.SANDBOX_PLATFORM_PREFERRED,
+            platform_fallback=self.SANDBOX_PLATFORM_FALLBACK,
+            allow_platform_fallback=self.SANDBOX_ALLOW_PLATFORM_FALLBACK,
             exec_timeout_seconds=self.SANDBOX_EXEC_TIMEOUT_SECONDS,
             queue_timeout_seconds=self.SANDBOX_QUEUE_TIMEOUT_SECONDS,
             max_inflight=self.SANDBOX_MAX_INFLIGHT,
