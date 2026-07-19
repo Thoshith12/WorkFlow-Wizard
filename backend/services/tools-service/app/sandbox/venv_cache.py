@@ -85,6 +85,10 @@ class VenvCache:
         if venv_path.exists():
             return venv_path
 
+        # The venv supplies only site-packages — the sandboxed process runs on
+        # the real interpreter bind-mounted from /usr/local (see oci.py), so the
+        # venv's own bin/python3 (a symlink back to this container's system
+        # python3) is never invoked and doesn't need to be a standalone copy.
         proc = await asyncio.create_subprocess_exec(
             "python3", "-m", "venv", str(venv_path),
             stdout=asyncio.subprocess.PIPE,
@@ -98,6 +102,10 @@ class VenvCache:
     async def _build_venv(self, venv_path: Path, requirements: List[str]) -> None:
         """Create a venv and pip install requirements into it."""
         # Create venv
+        # The venv supplies only site-packages — the sandboxed process runs on
+        # the real interpreter bind-mounted from /usr/local (see oci.py), so the
+        # venv's own bin/python3 (a symlink back to this container's system
+        # python3) is never invoked and doesn't need to be a standalone copy.
         proc = await asyncio.create_subprocess_exec(
             "python3", "-m", "venv", str(venv_path),
             stdout=asyncio.subprocess.PIPE,

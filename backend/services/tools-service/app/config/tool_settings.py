@@ -11,10 +11,12 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Tuple
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_Platform = Literal["ptrace", "systrap", "kvm"]
 
 
 @dataclass(frozen=True)
@@ -36,13 +38,25 @@ class SandboxConfig:
     sandbox_gid: int = 65534  # nobody
 
     # gVisor syscall-interception platform. Preferred is attempted first on a
-    # container's first boot in this process; if it fails, pool.py falls back
-    # once to `platform_fallback` and stays on whatever worked for the rest
-    # of the process's lifetime. Set allow_platform_fallback=False to have
-    # boot fail hard instead of silently running on a weaker platform.
-    platform_preferred: Literal["ptrace", "systrap", "kvm"] = "systrap"
-    platform_fallback: Literal["ptrace", "systrap", "kvm"] = "systrap"
+    # container's first boot in this process; if it fails, pool.py walks
+    # platform_fallback_chain in order and stays on whatever worked for the
+    # rest of the process's lifetime. Set allow_platform_fallback=False to have
+    # boot fail hard on the first failure instead of walking the chain.
+    platform_preferred: _Platform = "kvm"
+    platform_fallback_chain: Tuple[_Platform, ...] = ("systrap", "ptrace")
     allow_platform_fallback: bool = True
+
+    # Dev-only escape hatch for gVisor's sentry/gofer bootstrap (its own mount
+    # namespace + chroot + /proc mount) failing when runsc itself runs nested
+    # inside another container's already-restricted mount namespace — appends
+    # --TESTONLY-unsafe-nonroot, which reuses the host's existing /proc and /
+    # instead of creating a new mount namespace for the gofer. Named exactly
+    # that way by gVisor's own maintainers — NOT a substitute for a real target
+    # environment, and must never be set outside local dev. Does not weaken the
+    # isolation between the sandboxed application and the sentry (ptrace/
+    # systrap/kvm syscall interception, and the uid-owner iptables scoping, are
+    # both unaffected) — only the sentry/gofer's own isolation from the host.
+    unsafe_nested_dev: bool = False
 
     # Per-subprocess execution timeout — kills the subprocess ONLY, not the container.
     exec_timeout_seconds: int = 30
@@ -83,9 +97,10 @@ class ToolSettings(BaseSettings):
     SANDBOX_CPU_QUOTA_PERCENT: int = Field(default=300)
     SANDBOX_UID: int = Field(default=65534)
     SANDBOX_GID: int = Field(default=65534)
-    SANDBOX_PLATFORM_PREFERRED: Literal["ptrace", "systrap", "kvm"] = Field(default="systrap")
-    SANDBOX_PLATFORM_FALLBACK: Literal["ptrace", "systrap", "kvm"] = Field(default="systrap")
+    SANDBOX_PLATFORM_PREFERRED: _Platform = Field(default="kvm")
+    SANDBOX_PLATFORM_FALLBACK_CHAIN: str = Field(default="systrap,ptrace")
     SANDBOX_ALLOW_PLATFORM_FALLBACK: bool = Field(default=True)
+    SANDBOX_UNSAFE_NESTED_DEV: bool = Field(default=False)
     SANDBOX_EXEC_TIMEOUT_SECONDS: int = Field(default=30)
     SANDBOX_QUEUE_TIMEOUT_SECONDS: int = Field(default=15)
     SANDBOX_MAX_INFLIGHT: int = Field(default=10)
@@ -118,8 +133,11 @@ class ToolSettings(BaseSettings):
             sandbox_uid=self.SANDBOX_UID,
             sandbox_gid=self.SANDBOX_GID,
             platform_preferred=self.SANDBOX_PLATFORM_PREFERRED,
-            platform_fallback=self.SANDBOX_PLATFORM_FALLBACK,
+            platform_fallback_chain=tuple(
+                p.strip() for p in self.SANDBOX_PLATFORM_FALLBACK_CHAIN.split(",") if p.strip()
+            ),
             allow_platform_fallback=self.SANDBOX_ALLOW_PLATFORM_FALLBACK,
+            unsafe_nested_dev=self.SANDBOX_UNSAFE_NESTED_DEV,
             exec_timeout_seconds=self.SANDBOX_EXEC_TIMEOUT_SECONDS,
             queue_timeout_seconds=self.SANDBOX_QUEUE_TIMEOUT_SECONDS,
             max_inflight=self.SANDBOX_MAX_INFLIGHT,

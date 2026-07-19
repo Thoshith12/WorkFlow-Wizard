@@ -23,7 +23,10 @@ class DuckDuckGoSearchTool(BaseTool):
 
     def _run(self, query: str) -> str:
         try:
-            from duckduckgo_search import DDGS
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                from duckduckgo_search import DDGS
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=5))
                 if not results:

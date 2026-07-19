@@ -2,7 +2,13 @@
 app.sandbox.server — In-container asyncio server (warm process).
 
 This module runs INSIDE the gVisor container. It:
-  1. Listens on a Unix socket for execution requests.
+  1. Listens on a loopback TCP port (127.0.0.1) for execution requests.
+     AF_UNIX is NOT used — gVisor virtualizes AF_UNIX sockets entirely inside
+     its Sentry, so a bind() inside the sandbox never materializes a real,
+     connectable socket on the host side of a bind mount. TCP over loopback
+     goes through the real (host-shared, via --network=host) network stack,
+     so the executor in the tools-service process can actually reach it, while
+     127.0.0.1 keeps it unreachable from any other container/namespace.
   2. For each request, spawns a fresh multiprocessing.Process with:
      - Clean safe-builtins (no open, no __import__)
      - Config pre-loaded into exec namespace as a plain dict
@@ -34,8 +40,8 @@ logger = logging.getLogger(__name__)
 # Path where the trusted runner (container boot) writes config.json
 CONFIG_PATH = Path("/run/sandbox/config.json")
 
-# Socket path (bind address inside the container)
-SOCKET_PATH = os.environ.get("SANDBOX_SOCKET_PATH", "/run/sandbox/tool.sock")
+# Loopback UDS path the server listens on
+SOCK_PATH = os.environ.get("SANDBOX_SOCK", "/run/sandbox/tool.sock")
 
 # Safe builtins — deliberately minimal. No open(), no __import__().
 _SAFE_BUILTINS = {
@@ -227,14 +233,22 @@ async def handle_connection(
 
 
 async def main() -> None:
-    """Start the Unix socket server inside the container."""
-    # Remove stale socket file
-    sock_path = Path(SOCKET_PATH)
-    sock_path.unlink(missing_ok=True)
-    sock_path.parent.mkdir(parents=True, exist_ok=True)
+    """Start the loopback UDS server inside the container."""
+    # Ensure any stale socket is removed
+    if os.path.exists(SOCK_PATH):
+        try:
+            os.remove(SOCK_PATH)
+        except OSError:
+            pass
 
-    server = await asyncio.start_unix_server(handle_connection, path=str(sock_path))
-    logger.info("Sandbox server listening on %s", SOCKET_PATH)
+    server = await asyncio.start_unix_server(handle_connection, path=SOCK_PATH)
+    logger.info("Sandbox server listening on %s", SOCK_PATH)
+
+    # Change permissions so host can connect if needed
+    try:
+        os.chmod(SOCK_PATH, 0o777)
+    except Exception as e:
+        logger.warning("Could not chmod socket: %s", e)
 
     async with server:
         await server.serve_forever()

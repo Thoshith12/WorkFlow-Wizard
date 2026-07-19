@@ -5,7 +5,7 @@ Implements the production sandbox execution path:
   1. Acquire global semaphore slot (or raise SandboxBusy + 503)
   2. Acquire per-tool semaphore slot
   3. Get or boot a warm container for this tool via SandboxPool
-  4. Send execution request over Unix socket to the in-container server
+  4. Send execution request over loopback TCP to the in-container server
   5. Wait for result (non-blocking via add_reader, not poll loop)
   6. Release semaphore slots
 
@@ -109,17 +109,18 @@ class GVisorSandboxExecutor(BaseSandboxExecutor):
         timeout_seconds: int,
     ) -> Dict[str, Any]:
         """
-        Send an execution request to the warm container's Unix socket server.
+        Send an execution request to the warm container's loopback TCP server.
 
-        Gets the socket path from the SandboxPool (which handles boot-on-miss,
-        liveness checks, and dead-socket recovery).
+        Gets the port from the SandboxPool (which handles boot-on-miss,
+        liveness checks, and dead-port recovery).
         """
         from app.sandbox.pool import sandbox_pool
 
         tool_key = f"{tool.name}@{tool.version}"
 
         # Get or boot the warm container
-        socket_path = await sandbox_pool.get_or_start(tool)
+        bundle_path = await sandbox_pool.get_or_start(tool)
+        sock_path = f"{bundle_path}/run/sandbox/tool.sock"
 
         # Build request payload
         request = {
@@ -134,15 +135,16 @@ class GVisorSandboxExecutor(BaseSandboxExecutor):
 
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(socket_path),
+                asyncio.open_unix_connection(sock_path),
                 timeout=5.0,
             )
-        except (ConnectionRefusedError, FileNotFoundError, asyncio.TimeoutError) as exc:
+        except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as exc:
             # Dead socket — invalidate and retry once
-            logger.warning("Socket connect failed for %s, invalidating: %s", tool_key, exc)
+            logger.warning("Sandbox connect failed for %s, invalidating: %s", tool_key, exc)
             await sandbox_pool.invalidate(tool.name, tool.version)
-            socket_path = await sandbox_pool.get_or_start(tool)
-            reader, writer = await asyncio.open_unix_connection(socket_path)
+            bundle_path = await sandbox_pool.get_or_start(tool)
+            sock_path = f"{bundle_path}/run/sandbox/tool.sock"
+            reader, writer = await asyncio.open_unix_connection(sock_path)
 
         try:
             # Send length-prefixed request

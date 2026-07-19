@@ -48,7 +48,7 @@ _BLOCKED_CIDRS = [
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
-    "127.0.0.0/8",
+    # 127.0.0.0/8 is removed to allow sandbox loopback TCP server to work
     "169.254.0.0/16",
 ]
 

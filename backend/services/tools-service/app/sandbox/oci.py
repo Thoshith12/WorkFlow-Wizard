@@ -14,10 +14,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 from app.config.tool_settings import tool_settings
 from app.models.custom_tool import CustomTool
@@ -28,16 +27,17 @@ BUNDLES_DIR = Path("/tmp/tool-bundles")
 
 
 async def build_oci_bundle(
-    *,
     tool: CustomTool,
     venv_path: Path,
-) -> Tuple[Path, Path]:
+) -> Path:
     """
     Build an OCI bundle directory for the given tool.
 
+    The in-container server listens on loopback TCP `port` (not a Unix socket —
+    gVisor virtualizes AF_UNIX away under --network=host; see server.py).
+
     Returns:
-        (bundle_path, socket_path) — the bundle directory and the Unix
-        socket path where the in-container server will listen.
+        bundle_path — the bundle directory `runsc run --bundle` consumes.
     """
     cfg = tool_settings.sandbox
     tool_key = f"{tool.name}-{tool.version}"
@@ -51,14 +51,11 @@ async def build_oci_bundle(
     bundle_path.mkdir(parents=True, exist_ok=True)
     rootfs_path.mkdir(parents=True, exist_ok=True)
 
-    # Socket path (accessible from host via bind mount)
-    socket_dir = bundle_path / "sockets"
-    socket_dir.mkdir(parents=True, exist_ok=True)
-    socket_path = socket_dir / "tool.sock"
-
     # Write config.json for the tool (config key-values)
     run_sandbox_dir = rootfs_path / "run" / "sandbox"
     run_sandbox_dir.mkdir(parents=True, exist_ok=True)
+    import os
+    os.chmod(str(run_sandbox_dir), 0o777)
 
     config_json_path = run_sandbox_dir / "config.json"
     config_json_path.write_text(json.dumps(tool.config or {}))
@@ -78,8 +75,13 @@ async def build_oci_bundle(
                 "python3", "-u", "/run/sandbox/server.py",
             ],
             "env": [
+                # python3 resolves from the bind-mounted /usr/local/bin (see mounts
+                # below) — the real, standard interpreter, not anything venv-provided.
                 "PATH=/usr/local/bin:/usr/bin:/bin",
-                f"SANDBOX_SOCKET_PATH=/run/sandbox/tool.sock",
+                # Extra pip packages from the per-tool venv (site-packages only —
+                # the venv supplies no interpreter of its own in this design).
+                "PYTHONPATH=/opt/venv/lib/python3.11/site-packages",
+                "SANDBOX_SOCK=/run/sandbox/tool.sock",
                 "PYTHONDONTWRITEBYTECODE=1",
                 "PYTHONUNBUFFERED=1",
             ],
@@ -110,16 +112,35 @@ async def build_oci_bundle(
                 "source": str(venv_path),
                 "options": ["rbind", "ro"],
             },
+            # The sandbox rootfs has no base OS/Python install of its own (by
+            # design — no full image per tool). These three give every custom
+            # tool a real, standard Python 3.11 runtime (interpreter + stdlib +
+            # its shared library dependencies) for free, reusing exactly what's
+            # already installed in this container. The per-tool venv above only
+            # needs to supply extra pip packages (via PYTHONPATH below), not its
+            # own interpreter.
+            {
+                "destination": "/usr/local",
+                "type": "bind",
+                "source": "/usr/local",
+                "options": ["rbind", "ro"],
+            },
+            {
+                "destination": "/lib",
+                "type": "bind",
+                "source": "/lib",
+                "options": ["rbind", "ro"],
+            },
+            {
+                "destination": "/lib64",
+                "type": "bind",
+                "source": "/lib64",
+                "options": ["rbind", "ro"],
+            },
             {
                 "destination": "/run/sandbox",
                 "type": "bind",
                 "source": str(run_sandbox_dir),
-                "options": ["rbind", "ro"],
-            },
-            {
-                "destination": "/run/sandbox/tool.sock",
-                "type": "bind",
-                "source": str(socket_path),
                 "options": ["rbind", "rw"],
             },
         ],
@@ -150,4 +171,4 @@ async def build_oci_bundle(
     config_path.write_text(json.dumps(oci_config, indent=2))
 
     logger.info("Built OCI bundle for %s at %s", tool_key, bundle_path)
-    return bundle_path, socket_path
+    return bundle_path

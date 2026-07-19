@@ -225,9 +225,21 @@ services:
       - DB_PASSWORD=${TOOLS_DB_PASSWORD:-tools_password}
       - REDIS_HOST=redis
       - KEYCLOAK_SERVER_URL=http://keycloak:8080/
+      # environment: takes precedence over env_file for the same key, so a
+      # shell-exported override works without editing .env's committed default.
+      - SANDBOX_UNSAFE_NESTED_DEV=${SANDBOX_UNSAFE_NESTED_DEV:-false}
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
+      - SYS_CHROOT
+    security_opt:
+      - seccomp:unconfined
+    # gVisor's chroot setup needs /tmp to be its own mount (pivot_root requires
+    # the target to have a distinct parent mount) — without this, runsc fails with
+    # "pivot_root failed, make sure that the root mount has a parent" since /tmp
+    # would otherwise just be a plain directory on the container's single overlay root.
+    tmpfs:
+      - /tmp:exec
     volumes:
       - ./backend/services/tools-service/app:/workspace/app
       - tool_venv_cache:/tmp/tool-venvs

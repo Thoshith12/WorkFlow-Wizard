@@ -43,6 +43,21 @@ class SandboxPool:
         # kvm) on every single container boot. Cleared only by a process restart,
         # which re-probes from tool_settings.sandbox.platform_preferred again.
         self._resolved_platform: Optional[str] = None
+        # Warn once per process, not once per boot, when running with the
+        # dev-only --TESTONLY-unsafe-nonroot flag active.
+        self._warned_unsafe_nested_dev: bool = False
+        # `runsc port-forward` subprocess per tool — gVisor's --network=host
+        # does not expose a sandbox's own listening sockets to the host
+        # directly (confirmed empirically; port-forward is gVisor's own
+        # supported bridge). Not Redis-persisted: a subprocess handle can't
+        # survive serialization or a tools-service restart, same as `proc`.
+        self._port_forward_procs: Dict[str, asyncio.subprocess.Process] = {}
+        # Continuously-drained tail of each runsc process's stderr, keyed by
+        # pid — nothing else reads stdout/stderr while a container is alive,
+        # and an undrained pipe can fill its OS buffer (64KB) and block the
+        # child on write() indefinitely. Bounded (last ~2000 bytes) so it
+        # doesn't grow unbounded over a long-lived warm container's lifetime.
+        self._stderr_tails: Dict[int, bytearray] = {}
 
     def _registry_key(self, tool_name: str, tool_version: str) -> str:
         """Host-scoped Redis key for horizontal scaling."""
@@ -51,11 +66,11 @@ class SandboxPool:
     async def _get_redis(self):
         """Get the Redis client from the shared ServerManager."""
         from shared.database import server_manager
-        return await server_manager.get_adapter("redis").get_client()
+        return server_manager.get("redis").client
 
     async def get_or_start(self, tool: CustomTool) -> str:
         """
-        Return the Unix socket path for a warm container.
+        Return the loopback TCP port of a warm container's server.
 
         If no container exists or the existing one is dead, boot a new one.
         Uses a per-tool asyncio lock to prevent double-booting.
@@ -64,18 +79,16 @@ class SandboxPool:
         reg_key = self._registry_key(tool.name, tool.version)
 
         # Check local cache first (hot path — skip liveness probe if recent)
+        # Check local cache first
         cached = self._local_cache.get(tool_key)
         if cached:
-            last_active = cached.get("last_active", 0)
-            if time.time() - last_active < 1.0:
-                return cached["socket_path"]
-
-            # Liveness probe on cached entry
-            if await self._socket_alive(cached["socket_path"]):
+            bundle_path = cached["bundle_path"]
+            sock_path = f"{bundle_path}/run/sandbox/tool.sock"
+            if await self._uds_alive(sock_path):
                 cached["last_active"] = time.time()
-                return cached["socket_path"]
+                return bundle_path
             else:
-                logger.warning("Dead socket for %s, invalidating.", tool_key)
+                logger.warning("Dead sandbox socket for %s, invalidating.", tool_key)
                 await self.invalidate(tool.name, tool.version)
 
         # Check Redis registry
@@ -83,16 +96,16 @@ class SandboxPool:
         entry_raw = await redis.get(reg_key)
         if entry_raw:
             entry = json.loads(entry_raw)
-            socket_path = entry["socket_path"]
-            if await self._socket_alive(socket_path):
+            bundle_path = entry["bundle_path"]
+            sock_path = f"{bundle_path}/run/sandbox/tool.sock"
+            if await self._uds_alive(sock_path):
                 self._local_cache[tool_key] = {
-                    "socket_path": socket_path,
                     "last_active": time.time(),
                     **entry,
                 }
-                return socket_path
+                return bundle_path
             else:
-                logger.warning("Dead socket in Redis for %s, invalidating.", tool_key)
+                logger.warning("Dead sandbox socket in Redis for %s, invalidating.", tool_key)
                 await self._cleanup_entry(tool_key, reg_key)
 
         # Boot new container (with lock to prevent double-boot)
@@ -102,8 +115,11 @@ class SandboxPool:
         async with self._boot_locks[tool_key]:
             # Double-check after acquiring lock
             cached = self._local_cache.get(tool_key)
-            if cached and await self._socket_alive(cached["socket_path"]):
-                return cached["socket_path"]
+            if cached:
+                bundle_path = cached["bundle_path"]
+                sock_path = f"{bundle_path}/run/sandbox/tool.sock"
+                if await self._uds_alive(sock_path):
+                    return bundle_path
 
             return await self._boot_with_lock(tool, tool_key, reg_key)
 
@@ -134,8 +150,10 @@ class SandboxPool:
                         **entry,
                         "last_active": time.time(),
                     }
-                    return entry["socket_path"]
+                    return entry["bundle_path"]
             raise RuntimeError(f"Timed out waiting for boot lock on {tool_key}")
+
+        logger.info("Boot lock acquired for %s", tool_key, extra={"tool_key": tool_key, "step": "lock_acquired"})
 
         # Lock heartbeat task — extends TTL during long boots
         heartbeat_task = asyncio.create_task(
@@ -144,17 +162,30 @@ class SandboxPool:
 
         try:
             # Build venv if needed
+            logger.info(
+                "Building venv for %s", tool_key,
+                extra={"tool_key": tool_key, "step": "venv_build_start"},
+            )
             from app.sandbox.venv_cache import venv_cache
             venv_path = await venv_cache.get_or_build(
                 requirements=tool.requirements or [],
                 venv_hash=tool.venv_hash,
             )
+            logger.info(
+                "venv ready for %s", tool_key,
+                extra={"tool_key": tool_key, "step": "venv_build_done", "venv_path": str(venv_path)},
+            )
 
-            # Build OCI bundle
             from app.sandbox.oci import build_oci_bundle
-            bundle_path, socket_path = await build_oci_bundle(
+            bundle_path = await build_oci_bundle(
                 tool=tool,
                 venv_path=venv_path,
+            )
+            logger.info(
+                "OCI bundle ready for %s", tool_key,
+                extra={
+                    "tool_key": tool_key, "step": "oci_bundle_done", "bundle_path": str(bundle_path),
+                },
             )
 
             # Start gVisor container (falls back to a secondary platform if the
@@ -164,17 +195,30 @@ class SandboxPool:
 
             platform_used, proc = await self._boot_container_with_platform_fallback(
                 bundle_path=bundle_path,
-                socket_path=socket_path,
                 container_id=container_id,
                 tool_key=tool_key,
             )
+            logger.info(
+                "Container boot succeeded for %s", tool_key,
+                extra={
+                    "tool_key": tool_key, "step": "container_boot_done",
+                    "container_id": container_id, "platform": platform_used, "pid": proc.pid,
+                },
+            )
 
             # Apply iptables rules for network isolation
+            logger.info(
+                "Applying iptables rules for %s", container_id,
+                extra={"tool_key": tool_key, "container_id": container_id, "step": "iptables_apply_start"},
+            )
             await apply_iptables_rules(container_id)
+            logger.info(
+                "iptables rules applied for %s", container_id,
+                extra={"tool_key": tool_key, "container_id": container_id, "step": "iptables_apply_done"},
+            )
 
-            # Register in Redis
             entry = {
-                "socket_path": str(socket_path),
+                "bundle_path": str(bundle_path),
                 "container_id": container_id,
                 "pid": proc.pid,
                 "platform": platform_used,
@@ -189,33 +233,114 @@ class SandboxPool:
             logger.info(
                 "Booted sandbox container for %s (pid=%s, platform=%s)",
                 tool_key, proc.pid, platform_used,
+                extra={
+                    "tool_key": tool_key, "step": "boot_complete",
+                    "container_id": container_id, "platform": platform_used, "pid": proc.pid, "bundle_path": str(bundle_path),
+                },
             )
-            return str(socket_path)
+            return str(bundle_path)
 
         finally:
             heartbeat_task.cancel()
             await redis.delete(lock_key)
+            logger.info(
+                "Boot lock released for %s", tool_key,
+                extra={"tool_key": tool_key, "step": "lock_released"},
+            )
 
     async def _boot_container(
         self, *, bundle_path, container_id: str, platform: str
     ) -> asyncio.subprocess.Process:
         """Start `runsc run` for one platform. Caller waits for socket liveness."""
-        return await asyncio.create_subprocess_exec(
-            "runsc", "run",
+        # runsc's usage is `runsc <flags> <subcommand> <subcommand args>` —
+        # --rootless/--network/--platform are global flags and must precede
+        # the `run` subcommand, not follow it (confirmed via `runsc --help`).
+        args = [
             "--rootless",
+            "--ignore-cgroups",
             "--network=host",
+            "--host-uds=all",
             f"--platform={platform}",
+        ]
+
+        if tool_settings.sandbox.unsafe_nested_dev:
+            args.append("--TESTONLY-unsafe-nonroot")
+            if not self._warned_unsafe_nested_dev:
+                self._warned_unsafe_nested_dev = True
+                logger.warning(
+                    "SANDBOX_UNSAFE_NESTED_DEV is enabled — runsc is passed "
+                    "--TESTONLY-unsafe-nonroot, which lets the sentry/gofer reuse the "
+                    "host's existing /proc and / instead of their own isolated mount "
+                    "namespace. This is a dev-only escape hatch for running gVisor "
+                    "nested inside another container and must never be set in a real "
+                    "deployment. It does not affect sandboxed-application isolation "
+                    "(ptrace/systrap/kvm syscall interception, uid-owner iptables "
+                    "scoping) — only the sentry/gofer's own isolation from the host.",
+                    extra={"step": "unsafe_nested_dev_active"},
+                )
+
+        proc = await asyncio.create_subprocess_exec(
+            "runsc",
+            *args,
+            "run",
             "--bundle", str(bundle_path),
             container_id,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        stderr_tail = bytearray()
+        self._stderr_tails[proc.pid] = stderr_tail
+        asyncio.create_task(self._drain_stream(proc.stdout, bytearray()))
+        asyncio.create_task(self._drain_stream(proc.stderr, stderr_tail))
+        return proc
 
-    async def _wait_for_socket(self, socket_path, attempts: int = 30, interval: float = 0.5) -> bool:
+    async def _drain_stream(
+        self, stream: Optional[asyncio.StreamReader], buffer: bytearray, max_len: int = 2000
+    ) -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    break
+                logger.info("SANDBOX STREAM: %s", chunk.decode(errors="replace").strip())
+                buffer.extend(chunk)
+                if len(buffer) > max_len:
+                    del buffer[: len(buffer) - max_len]
+        except Exception:
+            pass
+
+    async def _uds_alive(self, sock_path: str) -> bool:
+        """Quick liveness probe — try connecting to the UDS."""
+        if not os.path.exists(sock_path):
+            return False
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(sock_path),
+                timeout=1.0,
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception:
+            return False
+
+    async def _wait_for_uds(
+        self,
+        sock_path: str,
+        proc: Optional[asyncio.subprocess.Process] = None,
+        attempts: int = 30,
+        interval: float = 0.5,
+    ) -> bool:
         for _ in range(attempts):
             await asyncio.sleep(interval)
-            if await self._socket_alive(socket_path):
+            if proc is not None and proc.returncode is not None:
+                return False
+
+            if await self._uds_alive(sock_path):
                 return True
+
         return False
 
     async def _discard_failed_container(self, proc: asyncio.subprocess.Process, container_id: str) -> bytes:
@@ -251,58 +376,103 @@ class SandboxPool:
         return stderr
 
     async def _boot_container_with_platform_fallback(
-        self, *, bundle_path, socket_path, container_id: str, tool_key: str
+        self, *, bundle_path: Path, container_id: str, tool_key: str
     ) -> tuple[str, asyncio.subprocess.Process]:
         """
-        Boot the container on the resolved (or preferred) sandbox platform. If
-        this process hasn't resolved a working platform yet and the preferred
-        one fails to boot, falls back once to SANDBOX_PLATFORM_FALLBACK — loudly
-        logged, since a silent fallback to a weaker isolation platform is a
+        Boot the container by walking an ordered platform chain until one boots
+        successfully: [platform_preferred] + platform_fallback_chain (e.g.
+        kvm -> systrap -> ptrace). Every fallback step is logged loudly
+        (logger.error) — a silent fallback to a weaker isolation platform is a
         security regression, not a graceful degradation.
 
         Once a platform is known to work in this process, every later boot (for
-        any tool) uses it directly — no re-probing the preferred platform on
-        every single boot, and no per-boot fallback retry after that: a platform
-        that already worked once and later fails to boot for a specific tool
-        indicates a systemic problem (device permissions, host config) that an
-        in-process retry won't fix anyway. A full process restart re-probes from
-        platform_preferred again.
+        any tool) uses ONLY that platform — no re-probing the full chain on every
+        boot, and no fallback attempt if it later fails for a specific tool: a
+        platform that already worked once and later fails indicates a systemic
+        problem (device permissions, host config) that retrying other platforms
+        won't fix. A full process restart re-probes from platform_preferred again.
+
+        allow_platform_fallback=False restricts the chain to just the first
+        platform — failure raises immediately instead of walking the rest.
         """
         cfg = tool_settings.sandbox
-        platform = self._resolved_platform or cfg.platform_preferred
 
-        proc = await self._boot_container(bundle_path=bundle_path, container_id=container_id, platform=platform)
-        if await self._wait_for_socket(socket_path):
-            self._resolved_platform = platform
-            return platform, proc
+        if self._resolved_platform:
+            chain = [self._resolved_platform]
+            sources = ["resolved"]
+        else:
+            chain = [cfg.platform_preferred] + [
+                p for p in cfg.platform_fallback_chain if p != cfg.platform_preferred
+            ]
+            sources = ["preferred"] + [f"fallback[{i}]" for i in range(1, len(chain))]
 
-        stderr = await self._discard_failed_container(proc, container_id)
+        if not cfg.allow_platform_fallback:
+            chain = chain[:1]
+            sources = sources[:1]
 
-        if self._resolved_platform is not None or not cfg.allow_platform_fallback or platform == cfg.platform_fallback:
-            raise RuntimeError(
-                f"Sandbox container for {tool_key} failed to boot on platform '{platform}' "
-                f"and no fallback is available (allow_platform_fallback={cfg.allow_platform_fallback}). "
-                f"stderr: {stderr.decode(errors='replace')[:500]}"
+        last_stderr_text = ""
+        for index, (platform, source) in enumerate(zip(chain, sources)):
+            logger.info(
+                "Attempting sandbox boot on %s platform '%s' for %s",
+                source, platform, tool_key,
+                extra={
+                    "tool_key": tool_key, "container_id": container_id, "step": "platform_attempt",
+                    "platform": platform, "platform_source": source,
+                },
+            )
+            proc = await self._boot_container(bundle_path=bundle_path, container_id=container_id, platform=platform)
+            sock_path = str(bundle_path / "run" / "sandbox" / "tool.sock")
+            is_alive = await self._wait_for_uds(sock_path=sock_path, proc=proc)
+            if is_alive:
+                self._resolved_platform = platform
+                logger.info(
+                    "Platform '%s' booted successfully for %s", platform, tool_key,
+                    extra={
+                        "tool_key": tool_key, "container_id": container_id, "step": "platform_attempt_success",
+                        "platform": platform, "platform_source": source,
+                    },
+                )
+                return platform, proc
+            stderr = await self._discard_failed_container(proc, container_id)
+            last_stderr_text = stderr.decode(errors="replace")[:500]
+            logger.warning(
+                "Platform '%s' failed to boot container for %s",
+                platform, tool_key,
+                extra={
+                    "tool_key": tool_key, "container_id": container_id, "step": "platform_attempt_failed",
+                    "platform": platform, "platform_source": source, "stderr": last_stderr_text,
+                },
             )
 
-        logger.error(
-            "Sandbox platform '%s' failed to boot container for %s — falling back to '%s'. "
-            "Isolation for this process is now running on the fallback platform; investigate "
-            "why '%s' failed before relying on it again. stderr: %s",
-            platform, tool_key, cfg.platform_fallback, platform, stderr.decode(errors="replace")[:500],
-        )
+            if index == len(chain) - 1:
+                logger.error(
+                    "All sandbox platforms exhausted for %s (tried: %s) — boot aborted",
+                    tool_key, ", ".join(chain),
+                    extra={
+                        "tool_key": tool_key, "container_id": container_id, "step": "boot_aborted_chain_exhausted",
+                        "platforms_tried": list(chain),
+                    },
+                )
+                raise RuntimeError(
+                    f"Sandbox container for {tool_key} failed to boot on every platform tried "
+                    f"({', '.join(chain)}). Last stderr: {last_stderr_text}"
+                )
 
-        proc = await self._boot_container(bundle_path=bundle_path, container_id=container_id, platform=cfg.platform_fallback)
-        if not await self._wait_for_socket(socket_path):
-            fallback_stderr = await self._discard_failed_container(proc, container_id)
-            raise RuntimeError(
-                f"Sandbox container for {tool_key} failed to boot on both preferred platform "
-                f"'{platform}' and fallback platform '{cfg.platform_fallback}'. "
-                f"stderr: {fallback_stderr.decode(errors='replace')[:500]}"
+            next_platform = chain[index + 1]
+            logger.error(
+                "Sandbox platform '%s' failed to boot container for %s — falling back to '%s'. "
+                "Isolation for this process is now running on the fallback platform; investigate "
+                "why '%s' failed before relying on it again. stderr: %s",
+                platform, tool_key, next_platform, platform, last_stderr_text,
+                extra={
+                    "tool_key": tool_key, "container_id": container_id, "step": "platform_fallback_triggered",
+                    "failed_platform": platform, "fallback_platform": next_platform, "stderr": last_stderr_text,
+                },
             )
 
-        self._resolved_platform = cfg.platform_fallback
-        return cfg.platform_fallback, proc
+        # Unreachable — the loop above always returns on success or raises on
+        # the last chain element's failure.
+        raise RuntimeError(f"Sandbox container for {tool_key} failed to boot (no platforms attempted).")
 
     async def _lock_heartbeat(self, redis, lock_key: str, ttl: int) -> None:
         """
@@ -317,18 +487,7 @@ class SandboxPool:
         except asyncio.CancelledError:
             pass
 
-    async def _socket_alive(self, socket_path: str) -> bool:
-        """Quick liveness probe — open and immediately close a Unix connection."""
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(socket_path),
-                timeout=1.0,
-            )
-            writer.close()
-            await writer.wait_closed()
-            return True
-        except Exception:
-            return False
+    # Removed _port_alive
 
     async def _cleanup_entry(self, tool_key: str, reg_key: str) -> None:
         """Remove a dead entry from both local cache and Redis."""
