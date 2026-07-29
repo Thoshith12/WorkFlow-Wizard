@@ -16,6 +16,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from qdrant_client import QdrantClient
+from qdrant_client.http.models import SearchRequest as QdrantSearchRequest, NamedVector
 
 from shared.config.settings import settings
 from app.models.data_source import DataSource
@@ -63,7 +64,7 @@ async def execute_search(
       2. Fetch chunk metadata (embedding_model, vector_collection, config) from chunk_registry.
       3. Verify model config & dims in embedding_models registry.
       4. Embed user query using the connector's embedding model.
-      5. Search Qdrant collection using QdrantClient.
+      5. Search Qdrant collection using QdrantClient search_points API.
       6. Normalize scores to 0-1 and apply threshold filtering.
 
     Returns:
@@ -145,11 +146,12 @@ async def execute_search(
             detail=f"Failed to generate query embedding: {exc}",
         )
 
-    # 5. Execute Qdrant vector search ──────────────────────────────────────────
+    # ── 5. Execute Qdrant vector search ──────────────────────────────────────────
     try:
         qdrant = QdrantClient(
             host=settings.QDRANT_HOST,
             port=settings.QDRANT_PORT,
+            check_compatibility=False,
         )
 
         # Check if collection exists
@@ -163,20 +165,35 @@ async def execute_search(
         # Fetch extra items so threshold filtering doesn't drop below top_k
         fetch_limit = max(top_k * 3, 20)
 
-        # Vector search query format
-        if embedding_mode in (EmbeddingMode.DENSE.value, EmbeddingMode.HYBRID.value):
-            search_results = qdrant.search(
-                collection_name=vector_collection,
-                query_vector=("dense", query_vector),
-                limit=fetch_limit,
-            )
+        if hasattr(qdrant, "search"):
+            if embedding_mode in (EmbeddingMode.DENSE.value, EmbeddingMode.HYBRID.value):
+                search_results = qdrant.search(
+                    collection_name=vector_collection,
+                    query_vector=("dense", query_vector),
+                    limit=fetch_limit,
+                )
+            else:
+                search_results = qdrant.search(
+                    collection_name=vector_collection,
+                    query_vector=query_vector,
+                    limit=fetch_limit,
+                )
         else:
-            # Fallback for default vector
-            search_results = qdrant.search(
-                collection_name=vector_collection,
-                query_vector=query_vector,
+            if embedding_mode in (EmbeddingMode.DENSE.value, EmbeddingMode.HYBRID.value):
+                vec_arg = NamedVector(name="dense", vector=query_vector)
+            else:
+                vec_arg = query_vector
+
+            req = QdrantSearchRequest(
+                vector=vec_arg,
                 limit=fetch_limit,
+                with_payload=True,
             )
+            res = qdrant.http.search_api.search_points(
+                collection_name=vector_collection,
+                search_request=req,
+            )
+            search_results = res.result or []
 
     except HTTPException:
         raise
