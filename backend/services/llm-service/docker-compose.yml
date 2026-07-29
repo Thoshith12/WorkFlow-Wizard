@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  llm-service:
+    build:
+      context: ../../
+      dockerfile: services/llm-service/Dockerfile
+    container_name: llm-service
+    env_file:
+      - .env
+    ports:
+      - "${LLM_SERVICE_PORT:-8003}:8003"
+    depends_on:
+      - redis
+    networks:
+      - backend-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: llm-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - backend-net
+    restart: unless-stopped
+
+networks:
+  backend-net:
+    driver: bridge

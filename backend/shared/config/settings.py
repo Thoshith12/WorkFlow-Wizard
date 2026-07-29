@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE_MB: int = Field(default=20)
 
 
+    # ── LLM Service ───────────────────────────────────────────────────────────
+    ANTHROPIC_API_KEY: str = Field(default="")
+    LLM_SESSION_TTL_SECONDS: int = Field(default=3600)       # 1 hour sliding TTL
+    LLM_MAX_HISTORY_MESSAGES: int = Field(default=50)        # rolling window cap
+    LLM_SERVICE_PORT: int = Field(default=8003)
+
     # ── Service Ports ─────────────────────────────────────────────────────────
     FASTAPI_PORT: int = Field(default=8000)
     RAG_SERVICE_PORT: int = Field(default=8001)

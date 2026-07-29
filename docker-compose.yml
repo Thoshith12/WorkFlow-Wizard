@@ -253,6 +253,25 @@ services:
       keycloak:
         condition: service_started
 
+  # ── LLM microservice ────────────────────────────────────────────────────────
+  llm-service:
+    build:
+      context: ./backend
+      dockerfile: services/llm-service/Dockerfile
+    image: workflow-llm-service:latest
+    container_name: llm-service
+    ports:
+      - "${LLM_SERVICE_PORT:-8003}:8003"
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+
 
 volumes:
   postgres_data:
@@ -264,4 +283,6 @@ volumes:
     driver: local
   tool_venv_cache:
     driver: local
+
+
 

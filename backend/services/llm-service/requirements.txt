@@ -1,0 +1,25 @@
+# ── Core framework ────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+
+# ── LLM Providers ─────────────────────────────────────────────────────────────
+anthropic>=0.30.0          # Anthropic Python SDK (async support)
+
+# ── Validation ────────────────────────────────────────────────────────────────
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-multipart>=0.0.9
+
+# ── Infrastructure clients ────────────────────────────────────────────────────
+redis>=5.0.0               # Session history store
+
+# ── Shared package transitive deps ────────────────────────────────────────────
+# shared/database/adapters/__init__.py eagerly imports PostgresAdapter,
+# which requires sqlalchemy+asyncpg even if we only use RedisAdapter.
+sqlalchemy>=2.0.0
+asyncpg>=0.29.0
+qdrant-client>=1.9.0
+hvac>=2.1.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-jose>=3.3.0         # JWT decode (for optional auth middleware)
