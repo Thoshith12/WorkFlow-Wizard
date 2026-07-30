@@ -14,7 +14,7 @@ Interface & Validation Responsibilities:
 """
 import logging
 import os
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -24,6 +24,8 @@ from shared.config.settings import settings
 from shared.database.utils.pool import get_db
 from app.pipeline import run_ingestion_pipeline
 from app.tasks import extract_document_task
+from qdrant_client import QdrantClient
+from app.services.minio import minio_client
 from app.repositories import data_source as ds_repo
 from app.schemas.data_source import (
     IngestResponse,
@@ -56,8 +58,8 @@ async def ingest_files(
         description="Unique data source name.",
         examples=["project-docs"],
     ),
-    description: str = Form(
-        ...,
+    description: Optional[str] = Form(
+        None,
         description="Human-readable data source description.",
         examples=["Technical documentation for the project"],
     ),
@@ -215,8 +217,8 @@ async def get_data_source_detail(
                     file_size_bytes=cfg.get("file_size_bytes"),
                     content_type=cfg.get("content_type"),
                     language_detected=doc.language_detected or [],
-                    page_count=doc.page_count,
-                    error=doc.error,
+                    page_count=cfg.get("page_count"),
+                    error=doc.errors.get("message") if isinstance(doc.errors, dict) else (str(doc.errors) if doc.errors else None),
                     created_at=doc.created_at,
                 )
             )
@@ -245,3 +247,74 @@ async def get_data_source_detail(
         documents=doc_details,
         chunking_info=chunking_summary,
     )
+
+
+@router.delete(
+    "/data-sources/{data_source_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Delete Data Source",
+    description="Completely delete a data source and its documents/chunks across PostgreSQL, MinIO storage, and Qdrant vector collections.",
+)
+async def delete_data_source(
+    data_source_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a Data Source by UUID from:
+    1. Qdrant vector database (drops associated collections)
+    2. MinIO S3 object storage (removes all uploaded files)
+    3. PostgreSQL database (deletes data_source, document, and chunk records)
+    """
+    ds = await ds_repo.get_data_source_by_id(db, data_source_id)
+    if ds is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Data source '{data_source_id}' not found.",
+        )
+
+    # 1. Purge Qdrant vector collections
+    deleted_collections = []
+    try:
+        chunk_info = await ds_repo.get_chunk_summary_for_data_source(db, data_source_id)
+        target_collections = set(chunk_info.get("vector_collections", []))
+
+        qdrant = QdrantClient(
+            host=settings.QDRANT_HOST,
+            port=settings.QDRANT_PORT,
+            check_compatibility=False,
+        )
+        existing_cols = [c.name for c in qdrant.get_collections().collections]
+
+        ds_prefix = str(data_source_id)
+        for col_name in existing_cols:
+            if ds_prefix in col_name:
+                target_collections.add(col_name)
+
+        for col_name in target_collections:
+            if col_name in existing_cols:
+                logger.info("Deleting Qdrant collection '%s' for data_source_id=%s", col_name, data_source_id)
+                qdrant.delete_collection(collection_name=col_name)
+                deleted_collections.append(col_name)
+    except Exception as exc:
+        logger.warning("Error purging Qdrant vector collections for data_source_id=%s: %s", data_source_id, exc)
+
+    # 2. Purge MinIO S3 objects
+    minio_deleted_count = 0
+    try:
+        minio_deleted_count = await minio_client.delete_data_source_objects(data_source_id)
+        logger.info("Deleted %d objects from MinIO for data_source_id=%s", minio_deleted_count, data_source_id)
+    except Exception as exc:
+        logger.warning("Error purging MinIO objects for data_source_id=%s: %s", data_source_id, exc)
+
+    # 3. Purge PostgreSQL records (cascades to document_registry and chunk_registry)
+    ds_name = ds.name
+    await ds_repo.delete_data_source_by_id(db, data_source_id)
+    await db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Data source '{ds_name}' (ID: {data_source_id}) has been completely deleted.",
+        "data_source_id": str(data_source_id),
+        "deleted_minio_objects": minio_deleted_count,
+        "deleted_qdrant_collections": deleted_collections,
+    }

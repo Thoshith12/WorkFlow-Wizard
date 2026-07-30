@@ -25,6 +25,7 @@ from shared.database import server_manager
 from shared.database.adapters import PostgresAdapter, RedisAdapter, QdrantAdapter
 from app.core.lifespan import lifespan_handler
 from app.models.document import Document
+from app.models.data_source import DataSource
 from app.pipeline.preprocessing.steps import (
     fix_encoding,
     normalize_unicode,
@@ -389,6 +390,11 @@ async def _finalize_preprocessing_task_async(document_id_str: str, run_id: str, 
                         language_detected=detected_langs,
                         errors=errors_blob,
                     )
+                )
+                await session.execute(
+                    update(DataSource)
+                    .where(DataSource.id == data_source_id)
+                    .values(status="preprocessing completed")
                 )
 
         logger.info(

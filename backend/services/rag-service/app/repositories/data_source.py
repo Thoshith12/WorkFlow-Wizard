@@ -123,3 +123,19 @@ async def get_chunk_summary_for_data_source(
         "embedding_models": list(models_set),
         "embedding_modes": list(modes_set),
     }
+
+
+async def delete_data_source_by_id(
+    db: AsyncSession,
+    data_source_id: UUID,
+) -> bool:
+    """
+    Delete a DataSource record by primary key (cascades to documents and chunks in Postgres).
+    """
+    ds = await get_data_source_by_id(db, data_source_id)
+    if not ds:
+        return False
+    await db.delete(ds)
+    await db.flush()
+    logger.info("Deleted DataSource id=%s name=%r from database", ds.id, ds.name)
+    return True

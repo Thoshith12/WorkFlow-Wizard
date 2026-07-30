@@ -140,6 +140,18 @@ services:
       minio:
         condition: service_healthy
 
+  # ── Frontend web service ───────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: workflow-frontend:latest
+    container_name: workflow-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - backend
+
   # ── RAG microservice ────────────────────────────────────────────────────────
   rag-service:
     build:

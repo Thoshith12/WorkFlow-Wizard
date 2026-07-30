@@ -132,7 +132,21 @@ async def _chunking_orchestrator_async(data_source_id_str: str, config_json: str
     chunk_page_batch_task workers one-per-page-batch using Redis atomic counters.
     """
     async with lifespan_context():
-        config = json.loads(config_json)
+        try:
+            config = json.loads(config_json) if config_json else {}
+        except Exception:
+            config = {}
+
+        if "chunking_strategy" not in config:
+            config["chunking_strategy"] = "recursive"
+        if "recursive_config" not in config:
+            config["recursive_config"] = {"chunk_size": 512, "chunk_overlap": 50}
+        if "embedding_models" not in config:
+            config["embedding_models"] = ["sentence-transformers/all-MiniLM-L6-v2"]
+        if "embedding_mode" not in config:
+            config["embedding_mode"] = "dense"
+
+        config_json = json.dumps(config)
         data_source_id = UUID(data_source_id_str)
         job_id = data_source_id_str
         pages_per_batch: int = config.get("pages_per_batch", 10)
@@ -228,10 +242,17 @@ async def _chunk_page_batch_async(
 
     try:
         pages = json.loads(pages_json)
-        config = json.loads(config_json)
-        strategy = config["chunking_strategy"]
+        try:
+            config = json.loads(config_json) if config_json else {}
+        except Exception:
+            config = {}
+
+        strategy = config.get("chunking_strategy", "recursive")
         strategy_config_key = f"{strategy}_config"
-        strategy_config = config.get(strategy_config_key, {})
+        strategy_config = config.get(strategy_config_key, {
+            "chunk_size": 512,
+            "chunk_overlap": 50,
+        })
 
         from app.models.enums.chunking import ChunkingStrategy
         chunks = apply_chunking_strategy(

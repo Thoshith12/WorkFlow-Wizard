@@ -164,6 +164,38 @@ class MinioStorageClient:
         )
         return content
 
+    def _delete_data_source_objects_sync(self, bucket_name: str, prefix: str) -> int:
+        """Synchronous helper to list and remove all objects matching prefix."""
+        client = self._get_client()
+        count = 0
+        try:
+            if not client.bucket_exists(bucket_name):
+                return 0
+            objects = client.list_objects(bucket_name, prefix=prefix, recursive=True)
+            for obj in objects:
+                logger.info("Removing MinIO object '%s' from bucket '%s'", obj.object_name, bucket_name)
+                client.remove_object(bucket_name, obj.object_name)
+                count += 1
+        except S3Error as exc:
+            logger.error("MinIO S3Error during object deletion for prefix '%s': %s", prefix, exc)
+            raise
+        return count
+
+    async def delete_data_source_objects(self, data_source_id: UUID) -> int:
+        """
+        Asynchronously delete all MinIO stored files associated with data_source_id.
+
+        Args:
+            data_source_id: Data source UUID.
+
+        Returns:
+            Number of deleted MinIO objects.
+        """
+        target_bucket = settings.MINIO_BUCKET
+        prefix = f"{data_source_id}/"
+        logger.info("Deleting all MinIO objects under bucket '%s' prefix '%s'", target_bucket, prefix)
+        return await asyncio.to_thread(self._delete_data_source_objects_sync, target_bucket, prefix)
+
 
 # Module-level singleton instance
 minio_client = MinioStorageClient()
