@@ -34,6 +34,10 @@ venv/
 env/
 ENV/
 
+# Node Dependencies
+node_modules/
+**/node_modules/
+
 # IDE & Editor files
 .vscode/
 .idea/

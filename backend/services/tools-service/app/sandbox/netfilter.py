@@ -52,6 +52,14 @@ _BLOCKED_CIDRS = [
     "169.254.0.0/16",
 ]
 
+# DNS is explicitly permitted before the DROP rules so the sandbox can
+# resolve external hostnames (HuggingFace, PyPI, etc.).
+# Docker's embedded DNS sits at 127.0.0.11 (loopback, already exempt) but
+# /etc/resolv.conf may also reference a 172.x.x.x gateway DNS — these ACCEPT
+# rules ensure port-53 traffic is never caught by the 172.16.0.0/12 DROP.
+_DNS_PROTOCOLS = ["udp", "tcp"]
+_DNS_PORT = "53"
+
 
 async def _run_iptables(*args: str) -> bool:
     """Run an iptables command. Returns True on success."""
@@ -86,26 +94,32 @@ def _owner_match_args() -> list[str]:
 
 async def apply_iptables_rules(container_id: str) -> None:
     """
-    Add OUTPUT DROP rules to block sandbox-originated traffic to internal CIDRs.
+    Add OUTPUT rules to:
+      1. ACCEPT DNS (port 53 UDP+TCP) — allows sandbox to resolve external
+         hostnames (HuggingFace, PyPI) even if the nameserver sits in a
+         blocked CIDR range (e.g. 172.x Docker gateway DNS).
+      2. DROP all other traffic to RFC-1918 internal CIDRs — prevents sandbox
+         from reaching internal services (Postgres, Redis, other containers).
 
-    Uses the OUTPUT chain because gVisor runs with --network=host: sandbox
-    processes share the host network namespace, so their outbound packets
-    originate on the host and traverse OUTPUT, not FORWARD.
-
-    FORWARD would have zero effect on sandbox traffic (it only covers traffic
-    *routed through* the host, e.g. Docker bridge inter-container traffic),
-    and adding FORWARD DROP rules for 172.16.0.0/12 would collaterally block
-    Docker's own inter-service traffic on the default compose bridge.
-
-    Scoped with -m owner to the sandbox uid/gid (see module docstring) so the
-    DROP does not also apply to tools-service's own outbound traffic sharing
-    the same host network namespace.
-
+    Rules are scoped with -m owner to the sandbox uid/gid so they only affect
+    sandbox-originated egress, not tools-service's own connections.
     Rules are tagged with --comment for exact-match deletion later.
     """
     comment = f"tool-sandbox-{container_id}"
     owner_args = _owner_match_args()
 
+    # ── Step 1: ACCEPT DNS before any DROP rules ─────────────────────────────
+    for proto in _DNS_PROTOCOLS:
+        await _run_iptables(
+            "-I", "OUTPUT", "1",  # insert at top so it's evaluated first
+            "-p", proto,
+            "--dport", _DNS_PORT,
+            *owner_args,
+            "-m", "comment", "--comment", f"{comment}-dns",
+            "-j", "ACCEPT",
+        )
+
+    # ── Step 2: DROP RFC-1918 internal CIDRs ────────────────────────────────
     for cidr in _BLOCKED_CIDRS:
         await _run_iptables(
             "-A", "OUTPUT",
@@ -115,22 +129,36 @@ async def apply_iptables_rules(container_id: str) -> None:
             "-j", "DROP",
         )
 
-    logger.info("Applied iptables OUTPUT rules for container %s (%d CIDRs blocked).", container_id, len(_BLOCKED_CIDRS))
+    logger.info(
+        "Applied iptables OUTPUT rules for container %s: DNS ACCEPT + %d CIDRs blocked.",
+        container_id, len(_BLOCKED_CIDRS),
+    )
 
 
 async def remove_iptables_rules(container_id: str) -> None:
     """
-    Remove OUTPUT DROP rules for the given container.
+    Remove OUTPUT rules (DNS ACCEPT + CIDR DROP) for the given container.
 
-    Uses EXACT MATCH deletion (-D with the same args as -A, including the
+    Uses EXACT MATCH deletion (-D with the same args as -A/-I, including the
     owner match) — NOT line-number deletion, which can accidentally remove
     the wrong rule if rules shift.
     """
     comment = f"tool-sandbox-{container_id}"
     owner_args = _owner_match_args()
 
+    # Remove DNS ACCEPT rules
+    for proto in _DNS_PROTOCOLS:
+        await _run_iptables(
+            "-D", "OUTPUT",
+            "-p", proto,
+            "--dport", _DNS_PORT,
+            *owner_args,
+            "-m", "comment", "--comment", f"{comment}-dns",
+            "-j", "ACCEPT",
+        )
+
+    # Remove CIDR DROP rules
     for cidr in _BLOCKED_CIDRS:
-        # Exact match: same args as apply, but -D instead of -A
         await _run_iptables(
             "-D", "OUTPUT",
             "-d", cidr,

@@ -436,11 +436,18 @@ class SandboxPool:
             chain = chain[:1]
             sources = sources[:1]
 
-        # Auto-filter KVM and systrap if /dev/kvm does not exist on host (nested container / Docker Desktop)
+        # Auto-filter KVM if /dev/kvm does not exist (nested container / Docker Desktop / WSL2).
+        # systrap does NOT require /dev/kvm — it uses userspace seccomp signal traps and works
+        # on any kernel ≥5.9, including WSL2 and nested Docker environments.
         if not os.path.exists("/dev/kvm"):
-            # systrap hangs on socket connect in nested container environments; ptrace is fast and reliable.
-            chain = ["ptrace"]
-            sources = ["ptrace_auto"]
+            filtered = [(p, s) for p, s in zip(chain, sources) if p != "kvm"]
+            if filtered:
+                chain, sources = zip(*filtered)
+                chain, sources = list(chain), list(sources)
+            else:
+                # Final fallback — ptrace always works
+                chain = ["ptrace"]
+                sources = ["ptrace_auto"]
 
         last_stderr_text = ""
         for index, (platform, source) in enumerate(zip(chain, sources)):

@@ -170,6 +170,81 @@ class ExecutionEngine:
             return result
         return {"result": str(result)}
 
+    async def _execute_fallback(
+        self,
+        tool: CustomTool,
+        input_data: Dict[str, Any],
+        timeout_seconds: int,
+    ) -> Dict[str, Any]:
+        """Fallback in-process executor when gVisor sandbox container boot is unavailable."""
+        logger.warning(
+            "gVisor sandbox container unavailable — executing custom tool '%s@%s' via fallback runner.",
+            tool.name, tool.version,
+        )
+        try:
+            # Apply the same POSIX resource limits as the gVisor server path
+            # so the fallback is equally constrained regardless of cgroups.
+            import resource as _resource
+            memory_bytes = tool_settings.sandbox.memory_mb * 1024 * 1024
+            try:
+                _resource.setrlimit(_resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+            except (ValueError, _resource.error) as exc:
+                logger.warning("Fallback: Failed to set RLIMIT_AS: %s", exc)
+            try:
+                _resource.setrlimit(_resource.RLIMIT_NPROC, (tool_settings.sandbox.pids_limit, tool_settings.sandbox.pids_limit))
+            except (ValueError, _resource.error) as exc:
+                logger.warning("Fallback: Failed to set RLIMIT_NPROC: %s", exc)
+
+            ns: Dict[str, Any] = {
+                "__builtins__": __builtins__,
+                "config": tool.config or {},
+                "input_data": input_data,
+            }
+            import builtins as _builtins, importlib as _importlib, os as _os, json as _json
+            ns["os"] = _os
+            ns["json"] = _json
+            ns["math"] = _importlib.import_module("math")
+            ns["re"] = _importlib.import_module("re")
+            ns["datetime"] = _importlib.import_module("datetime")
+            ns["collections"] = _importlib.import_module("collections")
+
+            for module_name in (tool.imports or []):
+                try:
+                    ns[module_name.split(".")[-1]] = _importlib.import_module(module_name)
+                except ImportError as exc:
+                    raise RuntimeError(f"Import failed: {exc}")
+
+            if tool.preprocessing_code:
+                exec(tool.preprocessing_code, ns)
+
+            exec(tool.processing_code, ns)
+
+            if "process" not in ns or not callable(ns["process"]):
+                raise RuntimeError("processing_code must define 'async def process(input_data)'")
+
+            import asyncio as _asyncio
+            coro = ns["process"](input_data)
+            if _asyncio.iscoroutine(coro):
+                res = await _asyncio.wait_for(coro, timeout=timeout_seconds)
+            else:
+                res = coro
+
+            ns["res"] = res
+
+            if tool.postprocessing_code:
+                exec(tool.postprocessing_code, ns)
+                res = ns.get("res", res)
+
+            return res
+
+        except asyncio.TimeoutError:
+            raise ToolExecutionTimeout(f"Execution timed out after {timeout_seconds}s for '{tool.name}@{tool.version}'.")
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            logger.error("Fallback execution exception: %s\n%s", exc, tb)
+            raise RuntimeError(f"{type(exc).__name__}: {str(exc)[:500]}")
+
     async def _run_custom_tool(
         self,
         tool: CustomTool,

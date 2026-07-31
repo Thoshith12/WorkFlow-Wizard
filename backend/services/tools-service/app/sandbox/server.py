@@ -3,6 +3,11 @@ app.sandbox.server — Sandboxed execution server running inside gVisor containe
 
 Reads execution request payloads from sys.stdin.buffer, executes user code in an
 isolated namespace, and writes length-prefixed JSON responses to sys.stdout.buffer.
+
+Resource limits (memory, pids, cpu) are enforced via POSIX setrlimit so they
+work regardless of whether gVisor is running with --ignore-cgroups (rootless).
+The limits are injected via /run/sandbox/config.json by oci.py at bundle build
+time, keyed under '_sandbox_limits'.
 """
 from __future__ import annotations
 
@@ -12,6 +17,7 @@ import importlib
 import json
 import logging
 import os
+import resource
 import struct
 import sys
 import traceback
@@ -21,6 +27,43 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger("sandbox.server")
 
 CONFIG_PATH = Path("/run/sandbox/config.json")
+
+
+def _apply_resource_limits(limits: Dict[str, Any]) -> None:
+    """
+    Apply POSIX resource limits from the config injected by oci.py.
+
+    These work regardless of --ignore-cgroups because they are enforced by the
+    Linux kernel's per-process rlimit subsystem, not cgroups:
+
+      RLIMIT_AS   — virtual address space cap = effective RAM cap.
+                    malloc/bytearray raises MemoryError when exceeded.
+      RLIMIT_NPROC — max number of processes/threads the sandbox can spawn.
+      RLIMIT_CPU  — max CPU seconds (soft=hard for hard enforcement).
+    """
+    memory_bytes = limits.get("memory_bytes")
+    if memory_bytes and memory_bytes > 0:
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+            logger.info("RLIMIT_AS set to %d bytes (%.1f MB)", memory_bytes, memory_bytes / (1024 ** 2))
+        except (ValueError, resource.error) as exc:
+            logger.warning("Failed to set RLIMIT_AS: %s", exc)
+
+    pids_limit = limits.get("pids_limit")
+    if pids_limit and pids_limit > 0:
+        try:
+            resource.setrlimit(resource.RLIMIT_NPROC, (pids_limit, pids_limit))
+            logger.info("RLIMIT_NPROC set to %d", pids_limit)
+        except (ValueError, resource.error) as exc:
+            logger.warning("Failed to set RLIMIT_NPROC: %s", exc)
+
+    cpu_seconds = limits.get("cpu_seconds")
+    if cpu_seconds and cpu_seconds > 0:
+        try:
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+            logger.info("RLIMIT_CPU set to %d seconds", cpu_seconds)
+        except (ValueError, resource.error) as exc:
+            logger.warning("Failed to set RLIMIT_CPU: %s", exc)
 
 
 async def _execute_user_code(
@@ -95,6 +138,24 @@ async def _execute_user_code(
 
 async def main() -> None:
     """Read length-prefixed JSON requests from stdin, write responses to stdout."""
+    # Apply POSIX resource limits before any user code runs.
+    # Limits are injected by oci.py into /run/sandbox/config.json under
+    # the '_sandbox_limits' key and enforced via setrlimit — works
+    # regardless of --ignore-cgroups on rootless gVisor.
+    config = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(str(CONFIG_PATH)) as f:
+                config = json.load(f)
+        except Exception as exc:
+            logger.warning("Failed to load config.json: %s", exc)
+
+    sandbox_limits = config.get("_sandbox_limits", {})
+    if sandbox_limits:
+        _apply_resource_limits(sandbox_limits)
+    else:
+        logger.warning("No '_sandbox_limits' in config.json — resource limits NOT enforced.")
+
     logger.info("Sandbox server active on stdio pipe.")
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()

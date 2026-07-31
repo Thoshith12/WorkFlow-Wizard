@@ -52,14 +52,26 @@ async def build_oci_bundle(
     bundle_path.mkdir(parents=True, exist_ok=True)
     rootfs_path.mkdir(parents=True, exist_ok=True)
 
-    # Write config.json for the tool (config key-values)
+    # Write config.json for the tool (config key-values) plus _sandbox_limits
+    # so server.py can enforce resource limits via POSIX setrlimit at startup.
+    # This works even when runsc runs with --ignore-cgroups (rootless Docker).
     run_sandbox_dir = rootfs_path / "run" / "sandbox"
     run_sandbox_dir.mkdir(parents=True, exist_ok=True)
     import os
     os.chmod(str(run_sandbox_dir), 0o777)
 
+    tool_config = dict(tool.config or {})
+    tool_config["_sandbox_limits"] = {
+        # RLIMIT_AS: virtual address space cap in bytes = effective RAM cap.
+        "memory_bytes": cfg.memory_mb * 1024 * 1024,
+        # RLIMIT_NPROC: max processes/threads the sandbox can spawn.
+        "pids_limit": cfg.pids_limit,
+        # RLIMIT_CPU: CPU seconds before SIGXCPU is raised.
+        # Use exec_timeout as the ceiling — sandbox code cannot run longer.
+        "cpu_seconds": cfg.exec_timeout_seconds,
+    }
     config_json_path = run_sandbox_dir / "config.json"
-    config_json_path.write_text(json.dumps(tool.config or {}))
+    config_json_path.write_text(json.dumps(tool_config))
 
     # Copy server.py into the rootfs
     server_src = Path(__file__).parent / "server.py"
@@ -85,6 +97,16 @@ async def build_oci_bundle(
                 f"SANDBOX_PORT={port}",
                 "PYTHONDONTWRITEBYTECODE=1",
                 "PYTHONUNBUFFERED=1",
+                # Allow HuggingFace/fastembed model caches to write to writable tmpfs.
+                "HOME=/tmp",
+                "HF_HOME=/tmp/hf_cache",
+                "FASTEMBED_CACHE_PATH=/tmp/fastembed_cache",
+                # SSL certificate locations — required for HTTPS (HuggingFace, PyPI).
+                # gVisor's internal reqwest TLS client reads SSL_CERT_FILE/DIR.
+                "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+                "SSL_CERT_DIR=/etc/ssl/certs",
+                "REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+                "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
             ],
             "cwd": "/",
             "rlimits": [
@@ -144,6 +166,30 @@ async def build_oci_bundle(
                 "source": str(run_sandbox_dir),
                 "options": ["rbind", "rw"],
             },
+            # Mount host DNS config so the sandbox can resolve external hostnames
+            # (HuggingFace, PyPI, etc.) while iptables owner rules still block
+            # RFC-1918 internal subnets (see netfilter.py).
+            {
+                "destination": "/etc/resolv.conf",
+                "type": "bind",
+                "source": "/etc/resolv.conf",
+                "options": ["rbind", "ro"],
+            },
+            {
+                "destination": "/etc/hosts",
+                "type": "bind",
+                "source": "/etc/hosts",
+                "options": ["rbind", "ro"],
+            },
+            # Mount host CA certificates so HTTPS connections (HuggingFace, PyPI)
+            # succeed inside the sandbox. Without this, TLS verification fails
+            # with gVisor's reqwest "builder error" (no trust anchors found).
+            {
+                "destination": "/etc/ssl/certs",
+                "type": "bind",
+                "source": "/etc/ssl/certs",
+                "options": ["rbind", "ro"],
+            },
         ],
         "linux": {
             "resources": {
@@ -163,7 +209,13 @@ async def build_oci_bundle(
                 {"type": "ipc"},
                 {"type": "uts"},
                 {"type": "mount"},
-                {"type": "network"},
+                # NOTE: network namespace intentionally omitted — rootless gVisor
+                # runs with --network=host which shares the host network namespace.
+                # A 'network' ns entry here is a no-op with --network=host and
+                # would conflict with /etc/resolv.conf DNS resolution.
+                # Internet access is permitted; internal RFC-1918 subnets are
+                # blocked via iptables OUTPUT rules scoped to the sandbox uid
+                # (see netfilter.py apply_iptables_rules).
             ],
         },
     }
