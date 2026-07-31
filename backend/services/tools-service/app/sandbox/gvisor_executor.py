@@ -182,12 +182,15 @@ class GVisorSandboxExecutor:
     ) -> Dict[str, Any]:
         """
         Send an execution request to the warm container process via stdio pipe IPC.
+
+        While waiting for the response, poll the host-side runsc process RSS
+        (includes systrap/sentry overhead) and kill the sandbox if it exceeds
+        SANDBOX_MEMORY_MB.
         """
         from app.sandbox.pool import sandbox_pool
 
         tool_key = f"{tool.name}@{tool.version}"
 
-        # Get or boot the warm container
         try:
             bundle_path, proc = await sandbox_pool.get_or_start(tool)
         except Exception as exc:
@@ -197,7 +200,6 @@ class GVisorSandboxExecutor:
             )
             return await self._execute_fallback(tool, input_data, timeout_seconds)
 
-        # Build request payload
         request = {
             "preprocessing_code": tool.preprocessing_code,
             "processing_code": tool.processing_code,
@@ -208,13 +210,14 @@ class GVisorSandboxExecutor:
         }
         request_bytes = json.dumps(request).encode()
 
-        try:
-            # Write length-prefixed request to container stdin
+        host_limit = tool_settings.sandbox.memory_mb * 1024 * 1024
+        stop_watch = asyncio.Event()
+
+        async def _read_response() -> Dict[str, Any]:
             proc.stdin.write(len(request_bytes).to_bytes(4, "big"))
             proc.stdin.write(request_bytes)
             await proc.stdin.drain()
 
-            # Read length-prefixed response from container stdout
             raw_len = await asyncio.wait_for(
                 proc.stdout.readexactly(4),
                 timeout=float(timeout_seconds),
@@ -238,9 +241,90 @@ class GVisorSandboxExecutor:
 
             return response.get("result", {})
 
+        read_task = asyncio.create_task(_read_response())
+        watch_task = asyncio.create_task(
+            self._watch_host_rss(proc.pid, host_limit, stop_watch, tool_key)
+        )
+
+        try:
+            done, pending = await asyncio.wait(
+                {read_task, watch_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Prefer propagating a memory-limit error if the watchdog finished first.
+            if watch_task in done:
+                exc = watch_task.exception()
+                if exc is not None:
+                    raise exc
+            if read_task in done:
+                return read_task.result()
+            raise SandboxError("Sandbox execution ended without a result.")
+        except SandboxError:
+            raise
         except (asyncio.TimeoutError, asyncio.IncompleteReadError, OSError) as exc:
-            logger.warning("Container stdio communication failed for %s — using fallback runner: %s", tool_key, exc)
+            # Watchdog may have killed runsc first; don't escape to unlimited fallback.
+            if watch_task.done():
+                watch_exc = watch_task.exception()
+                if isinstance(watch_exc, SandboxError):
+                    raise watch_exc
+            logger.warning(
+                "Container stdio communication failed for %s — using fallback runner: %s",
+                tool_key, exc,
+            )
             return await self._execute_fallback(tool, input_data, timeout_seconds)
+        finally:
+            stop_watch.set()
+            for t in (read_task, watch_task):
+                t.cancel()
+            await asyncio.gather(read_task, watch_task, return_exceptions=True)
+
+    async def _watch_host_rss(
+        self,
+        pid: int,
+        limit_bytes: int,
+        stop: asyncio.Event,
+        tool_key: str,
+        interval: float = 0.05,
+    ) -> None:
+        """
+        Poll host /proc/<runsc-pid>/status VmRSS.
+
+        This includes systrap/sentry overhead that guest /proc cannot see.
+        On breach: SIGKILL the runsc process so the request cannot succeed.
+        """
+        limit_mb = limit_bytes // (1024 * 1024)
+        while not stop.is_set():
+            rss = self._read_pid_rss_bytes(pid)
+            if rss > limit_bytes:
+                logger.error(
+                    "Host RSS watchdog: runsc pid=%s tool=%s rss=%d MB > limit %d MB "
+                    "(includes systrap) — killing sandbox",
+                    pid, tool_key, rss // (1024 * 1024), limit_mb,
+                )
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+                raise SandboxError(
+                    f"MemoryError: Physical RAM limit exceeded ({limit_mb} MB) "
+                    f"including runtime overhead"
+                )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                continue
+
+    @staticmethod
+    def _read_pid_rss_bytes(pid: int) -> int:
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0
 
     async def shutdown(self) -> None:
         """Graceful shutdown — delegates to SandboxPool."""

@@ -182,12 +182,12 @@ class ExecutionEngine:
             tool.name, tool.version,
         )
         try:
-            # Apply the same POSIX resource limits as the gVisor server path
-            # so the fallback is equally constrained regardless of cgroups.
+            # Prefer gVisor. Fallback RLIMIT_AS uses virtual_memory_mb (mmap
+            # headroom); physical RSS is only hard-enforced in the sandbox path.
             import resource as _resource
-            memory_bytes = tool_settings.sandbox.memory_mb * 1024 * 1024
+            vas_bytes = tool_settings.sandbox.virtual_memory_mb * 1024 * 1024
             try:
-                _resource.setrlimit(_resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+                _resource.setrlimit(_resource.RLIMIT_AS, (vas_bytes, vas_bytes))
             except (ValueError, _resource.error) as exc:
                 logger.warning("Fallback: Failed to set RLIMIT_AS: %s", exc)
             try:

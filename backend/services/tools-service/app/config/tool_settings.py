@@ -28,7 +28,15 @@ class SandboxConfig:
     """
 
     mode: Literal["none", "gvisor"] = "gvisor"
-    memory_mb: int = 256
+    # Total host RAM budget per sandbox (runsc RSS), including systrap/sentry.
+    # Sized for ~10 parallel tools on a 4 GB microservice (4000 / 10 ≈ 400).
+    memory_mb: int = 400
+    # gVisor systrap/sentry + Python baseline — subtracted from memory_mb for
+    # the in-guest RSS cap so tool code cannot spend the whole budget.
+    runtime_overhead_mb: int = 64
+    # Virtual address space (RLIMIT_AS). Larger than memory_mb so ML libs can
+    # mmap model files without committing that much physical RAM.
+    virtual_memory_mb: int = 2048
     pids_limit: int = 16
     cpu_quota_percent: int = 300  # 300% = 3 cores max
 
@@ -92,7 +100,9 @@ class ToolSettings(BaseSettings):
 
     # ── Sandbox ──────────────────────────────────────────────────────────────
     SANDBOX_MODE: Literal["none", "gvisor"] = Field(default="gvisor")
-    SANDBOX_MEMORY_MB: int = Field(default=256)
+    SANDBOX_MEMORY_MB: int = Field(default=400)
+    SANDBOX_RUNTIME_OVERHEAD_MB: int = Field(default=64)
+    SANDBOX_VIRTUAL_MEMORY_MB: int = Field(default=2048)
     SANDBOX_PIDS_LIMIT: int = Field(default=16)
     SANDBOX_CPU_QUOTA_PERCENT: int = Field(default=300)
     SANDBOX_UID: int = Field(default=65534)
@@ -128,6 +138,8 @@ class ToolSettings(BaseSettings):
         return SandboxConfig(
             mode=self.SANDBOX_MODE,
             memory_mb=self.SANDBOX_MEMORY_MB,
+            runtime_overhead_mb=self.SANDBOX_RUNTIME_OVERHEAD_MB,
+            virtual_memory_mb=self.SANDBOX_VIRTUAL_MEMORY_MB,
             pids_limit=self.SANDBOX_PIDS_LIMIT,
             cpu_quota_percent=self.SANDBOX_CPU_QUOTA_PERCENT,
             sandbox_uid=self.SANDBOX_UID,

@@ -60,10 +60,18 @@ async def build_oci_bundle(
     import os
     os.chmod(str(run_sandbox_dir), 0o777)
 
+    # Guest RSS budget = total host budget minus systrap/sentry overhead.
+    # Host-side watchdog on the runsc PID still enforces memory_mb in full.
+    guest_memory_mb = max(64, cfg.memory_mb - cfg.runtime_overhead_mb)
+
     tool_config = dict(tool.config or {})
     tool_config["_sandbox_limits"] = {
-        # RLIMIT_AS: virtual address space cap in bytes = effective RAM cap.
-        "memory_bytes": cfg.memory_mb * 1024 * 1024,
+        # Physical RSS cap inside the guest (bytes). Enforced by server.py
+        # RSS watchdog — cgroups are ignored under rootless --ignore-cgroups.
+        "memory_bytes": guest_memory_mb * 1024 * 1024,
+        # Virtual address space cap (RLIMIT_AS). Allows mmap/file maps up to
+        # this size without requiring that much physical RAM.
+        "virtual_memory_bytes": cfg.virtual_memory_mb * 1024 * 1024,
         # RLIMIT_NPROC: max processes/threads the sandbox can spawn.
         "pids_limit": cfg.pids_limit,
         # RLIMIT_CPU: CPU seconds before SIGXCPU is raised.
@@ -111,6 +119,12 @@ async def build_oci_bundle(
             "cwd": "/",
             "rlimits": [
                 {"type": "RLIMIT_NOFILE", "hard": 1024, "soft": 1024},
+                # VAS ceiling (not RSS). Physical RAM is enforced in server.py.
+                {
+                    "type": "RLIMIT_AS",
+                    "hard": cfg.virtual_memory_mb * 1024 * 1024,
+                    "soft": cfg.virtual_memory_mb * 1024 * 1024,
+                },
             ],
         },
         "root": {
@@ -133,7 +147,7 @@ async def build_oci_bundle(
                 "destination": "/opt/venv",
                 "type": "bind",
                 "source": str(venv_path),
-                "options": ["rbind", "ro"],
+                "options": ["rbind", "ro", "exec"],
             },
             # The sandbox rootfs has no base OS/Python install of its own (by
             # design — no full image per tool). These three give every custom
@@ -194,6 +208,8 @@ async def build_oci_bundle(
         "linux": {
             "resources": {
                 "memory": {
+                    # Full host budget (incl. overhead). Honored only when
+                    # cgroups are not ignored; guest+host watchdogs are primary.
                     "limit": cfg.memory_mb * 1024 * 1024,
                 },
                 "cpu": {

@@ -257,6 +257,7 @@ services:
     volumes:
       - ./backend/services/tools-service/app:/workspace/app
       - tool_venv_cache:/tmp/tool-venvs
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
     depends_on:
       postgres:
         condition: service_healthy

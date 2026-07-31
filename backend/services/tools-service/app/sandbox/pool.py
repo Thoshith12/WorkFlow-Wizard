@@ -301,8 +301,6 @@ class SandboxPool:
         # --rootless/--network/--platform are global flags and must precede
         # the `run` subcommand, not follow it (confirmed via `runsc --help`).
         args = [
-            "--rootless",
-            "--ignore-cgroups",
             "--network=host",
             "--host-uds=all",
             f"--platform={platform}",

@@ -4,9 +4,14 @@ app.sandbox.server — Sandboxed execution server running inside gVisor containe
 Reads execution request payloads from sys.stdin.buffer, executes user code in an
 isolated namespace, and writes length-prefixed JSON responses to sys.stdout.buffer.
 
-Resource limits (memory, pids, cpu) are enforced via POSIX setrlimit so they
-work regardless of whether gVisor is running with --ignore-cgroups (rootless).
-The limits are injected via /run/sandbox/config.json by oci.py at bundle build
+Resource limits:
+  - Physical RSS  — polled via /proc/self/status (cgroups are ignored under
+                    rootless runsc --ignore-cgroups). Guest budget already
+                    excludes systrap overhead (see oci.py).
+  - Virtual AS    — RLIMIT_AS (mmap / file-backed maps may exceed RSS).
+  - PIDs / CPU    — RLIMIT_NPROC / RLIMIT_CPU.
+
+Limits are injected via /run/sandbox/config.json by oci.py at bundle build
 time, keyed under '_sandbox_limits'.
 """
 from __future__ import annotations
@@ -18,8 +23,10 @@ import json
 import logging
 import os
 import resource
+import signal
 import struct
 import sys
+import threading
 import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -28,26 +35,104 @@ logger = logging.getLogger("sandbox.server")
 
 CONFIG_PATH = Path("/run/sandbox/config.json")
 
+# Physical RSS cap (bytes). 0 = disabled.
+_rss_limit_bytes: int = 0
+_rss_exceeded = threading.Event()
+_rss_stop = threading.Event()
+
+
+def _read_rss_bytes() -> int:
+    """Return current process RSS in bytes from /proc (0 if unavailable)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024  # kB → bytes
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _on_rss_signal(signum: int, frame: Any) -> None:
+    """Raise MemoryError into the main thread when the RSS watchdog fires."""
+    mb = _rss_limit_bytes // (1024 * 1024) if _rss_limit_bytes else 0
+    raise MemoryError(f"Physical RAM limit exceeded ({mb} MB)")
+
+
+def _rss_watchdog_loop(limit_bytes: int, interval: float = 0.05) -> None:
+    """
+    Background thread: poll VmRSS and signal the main thread on breach.
+
+    A thread is required because user code often does large synchronous
+    allocations that block the asyncio event loop.
+    """
+    while not _rss_stop.wait(interval):
+        rss = _read_rss_bytes()
+        if rss > limit_bytes:
+            _rss_exceeded.set()
+            logger.error(
+                "RSS watchdog: %d MB > limit %d MB — signalling MemoryError",
+                rss // (1024 * 1024),
+                limit_bytes // (1024 * 1024),
+            )
+            try:
+                os.kill(os.getpid(), signal.SIGUSR1)
+            except OSError:
+                os._exit(137)
+            return
+
+
+def _rss_over_limit() -> bool:
+    if _rss_exceeded.is_set():
+        return True
+    if _rss_limit_bytes > 0 and _read_rss_bytes() > _rss_limit_bytes:
+        _rss_exceeded.set()
+        return True
+    return False
+
 
 def _apply_resource_limits(limits: Dict[str, Any]) -> None:
     """
-    Apply POSIX resource limits from the config injected by oci.py.
+    Apply POSIX + RSS-watchdog limits from the config injected by oci.py.
 
-    These work regardless of --ignore-cgroups because they are enforced by the
-    Linux kernel's per-process rlimit subsystem, not cgroups:
-
-      RLIMIT_AS   — virtual address space cap = effective RAM cap.
-                    malloc/bytearray raises MemoryError when exceeded.
-      RLIMIT_NPROC — max number of processes/threads the sandbox can spawn.
-      RLIMIT_CPU  — max CPU seconds (soft=hard for hard enforcement).
+    Works regardless of --ignore-cgroups:
+      RLIMIT_AS    — virtual address space (mmap headroom).
+      RSS watchdog — physical RAM (VmRSS).
+      RLIMIT_NPROC — max processes/threads.
+      RLIMIT_CPU   — max CPU seconds.
     """
-    memory_bytes = limits.get("memory_bytes")
-    if memory_bytes and memory_bytes > 0:
+    global _rss_limit_bytes
+
+    vas_bytes = limits.get("virtual_memory_bytes") or 0
+    if vas_bytes and vas_bytes > 0:
         try:
-            resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
-            logger.info("RLIMIT_AS set to %d bytes (%.1f MB)", memory_bytes, memory_bytes / (1024 ** 2))
+            resource.setrlimit(resource.RLIMIT_AS, (vas_bytes, vas_bytes))
+            logger.info(
+                "RLIMIT_AS (virtual) set to %d MB",
+                vas_bytes // (1024 * 1024),
+            )
         except (ValueError, resource.error) as exc:
             logger.warning("Failed to set RLIMIT_AS: %s", exc)
+
+    memory_bytes = limits.get("memory_bytes") or 0
+    if memory_bytes and memory_bytes > 0:
+        _rss_limit_bytes = int(memory_bytes)
+        _rss_exceeded.clear()
+        _rss_stop.clear()
+        try:
+            signal.signal(signal.SIGUSR1, _on_rss_signal)
+        except (ValueError, OSError) as exc:
+            logger.warning("Failed to install SIGUSR1 handler: %s", exc)
+        threading.Thread(
+            target=_rss_watchdog_loop,
+            args=(_rss_limit_bytes,),
+            name="rss-watchdog",
+            daemon=True,
+        ).start()
+        logger.info(
+            "RSS watchdog armed at %d MB (guest physical RAM cap)",
+            _rss_limit_bytes // (1024 * 1024),
+        )
 
     pids_limit = limits.get("pids_limit")
     if pids_limit and pids_limit > 0:
@@ -121,14 +206,31 @@ async def _execute_user_code(
         else:
             res = coro
 
+        if _rss_over_limit():
+            mb = _rss_limit_bytes // (1024 * 1024)
+            return {
+                "status": "error",
+                "error": f"MemoryError: Physical RAM limit exceeded ({mb} MB)",
+            }
+
         ns["res"] = res
 
         if postprocessing_code:
             exec(postprocessing_code, ns)
             res = ns.get("res", res)
 
+        if _rss_over_limit():
+            mb = _rss_limit_bytes // (1024 * 1024)
+            return {
+                "status": "error",
+                "error": f"MemoryError: Physical RAM limit exceeded ({mb} MB)",
+            }
+
         return {"status": "ok", "result": res}
 
+    except MemoryError as exc:
+        logger.error("Physical RAM limit hit: %s", exc)
+        return {"status": "error", "error": f"MemoryError: {exc}"}
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error("User code execution exception: %s\n%s", exc, tb)
@@ -138,10 +240,6 @@ async def _execute_user_code(
 
 async def main() -> None:
     """Read length-prefixed JSON requests from stdin, write responses to stdout."""
-    # Apply POSIX resource limits before any user code runs.
-    # Limits are injected by oci.py into /run/sandbox/config.json under
-    # the '_sandbox_limits' key and enforced via setrlimit — works
-    # regardless of --ignore-cgroups on rootless gVisor.
     config = {}
     if CONFIG_PATH.exists():
         try:
