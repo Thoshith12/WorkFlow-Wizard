@@ -1,8 +1,10 @@
 import React from 'react';
-import { NavLink, useNavigate } from 'react-router-dom';
+import { NavLink, useNavigate, useLocation } from 'react-router-dom';
 
 export default function Sidebar() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const isToolsPage = location.pathname.startsWith('/tools');
 
   return (
     <nav class="bg-surface-container-lowest text-primary font-body-md text-body-md border-r border-outline-variant flex flex-col fixed left-0 top-0 h-full z-40 w-72">
@@ -11,11 +13,11 @@ export default function Sidebar() {
       </div>
       <div class="px-4 mb-6">
         <button
-          onClick={() => navigate('/rag/create')}
+          onClick={() => isToolsPage ? navigate('/tools/create') : navigate('/rag/create')}
           class="w-full bg-primary-container text-on-primary-container hover:bg-primary-fixed transition-colors py-2 px-4 rounded-lg flex items-center justify-center gap-2 font-bold text-body-md"
         >
           <span class="material-symbols-outlined text-[18px]">add</span>
-          Start New RAG Base
+          {isToolsPage ? 'Start New Tool' : 'Start New RAG Base'}
         </button>
       </div>
       <ul class="flex-1 px-3 space-y-1 overflow-y-auto">
@@ -47,6 +49,21 @@ export default function Sidebar() {
           >
             <span className="material-symbols-outlined text-[20px]">database</span>
             RAG Engine
+          </NavLink>
+        </li>
+        <li>
+          <NavLink
+            to="/tools"
+            className={({ isActive }) =>
+              `flex items-center gap-3 px-3 py-2 rounded-lg transition-all active:scale-95 duration-150 ${
+                isActive
+                  ? 'bg-secondary-container text-on-secondary-container font-bold shadow-[0_0_15px_rgba(4,180,162,0.1)]'
+                  : 'text-on-surface-variant hover:text-on-surface hover:bg-surface-variant'
+              }`
+            }
+          >
+            <span className="material-symbols-outlined text-[20px]" style={{ fontVariationSettings: "'FILL' 1" }}>construction</span>
+            <span className="font-medium">Tools</span>
           </NavLink>
         </li>
         <li>

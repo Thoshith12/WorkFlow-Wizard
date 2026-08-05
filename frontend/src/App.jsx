@@ -5,6 +5,7 @@ import LoginPage from './pages/LoginPage';
 import RagListPage from './pages/RagListPage';
 import RagCreatePage from './pages/RagCreatePage';
 import RagSearchPage from './pages/RagSearchPage';
+import ToolsPage from './pages/ToolsPage';
 import AppLayout from './components/AppLayout';
 import ProtectedRoute from './components/ProtectedRoute';
 
@@ -26,6 +27,7 @@ export default function App() {
             <Route path="/rag" element={<RagListPage />} />
             <Route path="/rag/create" element={<RagCreatePage />} />
             <Route path="/rag/search" element={<RagSearchPage />} />
+            <Route path="/tools" element={<ToolsPage />} />
             <Route path="*" element={<Navigate to="/rag" replace />} />
           </Route>
         </Routes>
