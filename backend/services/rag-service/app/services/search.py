@@ -16,7 +16,6 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import SearchRequest as QdrantSearchRequest, NamedVector
 
 from shared.config.settings import settings
 from app.models.data_source import DataSource
@@ -165,35 +164,25 @@ async def execute_search(
         # Fetch extra items so threshold filtering doesn't drop below top_k
         fetch_limit = max(top_k * 3, 20)
 
-        if hasattr(qdrant, "search"):
-            if embedding_mode in (EmbeddingMode.DENSE.value, EmbeddingMode.HYBRID.value):
-                search_results = qdrant.search(
-                    collection_name=vector_collection,
-                    query_vector=("dense", query_vector),
-                    limit=fetch_limit,
-                )
-            else:
-                search_results = qdrant.search(
-                    collection_name=vector_collection,
-                    query_vector=query_vector,
-                    limit=fetch_limit,
-                )
-        else:
-            if embedding_mode in (EmbeddingMode.DENSE.value, EmbeddingMode.HYBRID.value):
-                vec_arg = NamedVector(name="dense", vector=query_vector)
-            else:
-                vec_arg = query_vector
+        vec_using = "dense" if embedding_mode in (EmbeddingMode.DENSE.value, EmbeddingMode.HYBRID.value) else None
 
-            req = QdrantSearchRequest(
-                vector=vec_arg,
+        if hasattr(qdrant, "query_points"):
+            res = qdrant.query_points(
+                collection_name=vector_collection,
+                query=query_vector,
+                using=vec_using,
                 limit=fetch_limit,
                 with_payload=True,
             )
-            res = qdrant.http.search_api.search_points(
+            search_results = res.points
+        elif hasattr(qdrant, "search"):
+            search_results = qdrant.search(
                 collection_name=vector_collection,
-                search_request=req,
+                query_vector=("dense", query_vector) if vec_using else query_vector,
+                limit=fetch_limit,
             )
-            search_results = res.result or []
+        else:
+            search_results = []
 
     except HTTPException:
         raise
