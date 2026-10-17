@@ -9,18 +9,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     make \
     iptables \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
-# Install gVisor (runsc) — direct binary download per https://gvisor.dev/docs/user_guide/install/
+# Install gVisor (runsc) via tarball — new multi-file format introduced 2026-07
+# See: https://gvisor.dev/docs/user_guide/install/#install-latest
 RUN set -e \
     && ARCH=$(uname -m) \
     && URL=https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH} \
-    && curl -fSL -o runsc ${URL}/runsc \
-    && curl -fSL -o runsc.sha512 ${URL}/runsc.sha512 \
-    && sha512sum -c runsc.sha512 \
-    && rm -f runsc.sha512 \
-    && chmod a+rx runsc \
-    && mv runsc /usr/local/bin/runsc
+    && curl -fSL -o gvisor.tar.zstd ${URL}/gvisor.tar.zstd \
+    && curl -fSL -o gvisor.tar.zstd.sha512 ${URL}/gvisor.tar.zstd.sha512 \
+    && sha512sum -c gvisor.tar.zstd.sha512 \
+    && tar --zstd -xf gvisor.tar.zstd -C /usr/local/bin \
+    && rm -f gvisor.tar.zstd gvisor.tar.zstd.sha512
 
 # Install shared package (build context is backend/)
 COPY shared/ ./shared/
