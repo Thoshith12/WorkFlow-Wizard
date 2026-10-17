@@ -13,7 +13,9 @@ RUN pip install --no-cache-dir -e ./shared
 
 # Install service dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir cffi \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Copy application source
 COPY app/ ./app/
