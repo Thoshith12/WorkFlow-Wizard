@@ -17,7 +17,6 @@ from shared.database.adapters import (
     PostgresAdapter,
     QdrantAdapter,
     RedisAdapter,
-    VaultAdapter,
 )
 from shared.config.settings import settings
 
@@ -38,7 +37,8 @@ class LifespanHandler:
         server_manager.register("postgres", PostgresAdapter())
         server_manager.register("redis", RedisAdapter())
         server_manager.register("qdrant", QdrantAdapter())
-        server_manager.register("vault", VaultAdapter())
+        # VaultAdapter intentionally omitted — Vault is not used by any feature yet.
+        # Re-add when a service needs secret management.
 
         self._registered = True
         logger.info("All adapters registered with ServerManager.")

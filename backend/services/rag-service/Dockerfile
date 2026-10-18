@@ -16,13 +16,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY shared/ ./shared/
 RUN pip install --no-cache-dir -e ./shared
 
-# Install rag-service dependencies (fasttext-wheel compiles here — cached after first build)
-# Install torch first from the official PyTorch CUDA index to avoid PyPI timeout
-# on the 526 MB wheel and to get a CUDA-enabled build (not CPU-only)
-COPY services/rag-service/requirements.txt .
+# ── Torch (own layer — cached independently of requirements.txt) ──────────────
+# Pinned so Docker cache hits on every rebuild unless this line changes.
+# CUDA 12.1 build — matches the cu121 index.
 RUN pip install --no-cache-dir --timeout 300 \
-        torch --index-url https://download.pytorch.org/whl/cu121 \
-    && pip install --no-cache-dir --timeout 300 -r requirements.txt
+        torch==2.3.1+cu121 \
+        --index-url https://download.pytorch.org/whl/cu121
+
+# Install remaining rag-service dependencies (torch excluded — already above)
+COPY services/rag-service/requirements.txt .
+RUN pip install --no-cache-dir --timeout 300 -r requirements.txt
 
 # Download FastText language-identification model (~126 MB, cached after first build)
 # Path must match FASTTEXT_MODEL_PATH env var default in steps.py

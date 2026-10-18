@@ -71,7 +71,7 @@ services:
     ports:
       - "8201:8200"
     volumes:
-      - ./vault/config:/vault/config
+      - ./vault/config:/vault/config:ro
       - vault_data:/vault/data
     environment:
       - VAULT_ADDR=http://127.0.0.1:8200
@@ -79,10 +79,29 @@ services:
     cap_add:
       - IPC_LOCK
     healthcheck:
-      test: ["CMD-SHELL", "vault status -address=http://127.0.0.1:8200 || [ $$? -eq 2 ]"]
+      # RC=0 → active, RC=2 → sealed-but-alive; both mean Vault is running
+      test: ["CMD-SHELL", "vault status -address=http://127.0.0.1:8200; [ $$? -le 2 ]"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+
+  # One-shot sidecar: initializes Vault on first boot, unseals on every boot.
+  # Keys are stored inside vault_data (persists across restarts).
+  # Root token is written to vault_keys volume for backends to consume.
+  vault-init:
+    image: hashicorp/vault:1.15.0
+    container_name: vault-init
+    command: sh /vault/scripts/vault-init.sh
+    environment:
+      - VAULT_ADDR=http://vault:8200
+    volumes:
+      - ./vault/scripts:/vault/scripts:ro
+      - vault_data:/vault/data
+      - vault_keys:/vault/keys
+    depends_on:
+      vault:
+        condition: service_healthy
+    restart: "no"
 
   qdrant:
     image: qdrant/qdrant:v1.9.0
@@ -134,7 +153,7 @@ services:
       redis:
         condition: service_healthy
       vault:
-        condition: service_healthy
+        condition: service_started
       qdrant:
         condition: service_started
       minio:
@@ -309,7 +328,8 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  vault_data:
+  vault_data:      # Vault encrypted storage — persists secrets across restarts
+  vault_keys:      # Shared token file written by vault-init, read by backends
   qdrant_data:
   minio_data:
   hf_model_cache:
