@@ -6,10 +6,13 @@ pydantic-settings>=2.2.0
 python-multipart>=0.0.9
 
 # ── Database ──────────────────────────────────────────────────────────────────
-sqlalchemy>=2.0.0
+sqlalchemy[asyncio]>=2.0.0
 asyncpg>=0.29.0
 psycopg2-binary>=2.9.0
 alembic>=1.13.0
+
+# ── Secrets management ────────────────────────────────────────────────────────
+hvac>=2.1.0
 
 # ── Object storage (MinIO) ───────────────────────────────────────────────────
 httpx>=0.28.0
@@ -41,7 +44,7 @@ langchain-text-splitters>=0.2.0
 PyYAML>=6.0
 
 # sentence-transformers: HuggingFace embedding models (torch installed as pinned layer in Dockerfile)
-sentence-transformers>=2.7.0
+sentence-transformers>=2.7.0,<3.0.0
 # torch pinned to 2.3.1+cu121 — installed in Dockerfile before requirements.txt for layer caching
 
 # ── Agentic chunking (Claude Haiku 4.5 via Anthropic API) ────────────────────

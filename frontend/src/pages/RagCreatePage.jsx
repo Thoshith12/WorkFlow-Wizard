@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { getToken } from '../utils/auth';
+import { RAG_URL } from '../utils/apiConfig';
 
 const ALLOWED_EXTENSIONS = ['.pdf', '.doc', '.docx', '.txt'];
 const MAX_FILES = 10;
@@ -139,7 +140,7 @@ export default function RagCreatePage() {
         top_k: Number(searchTopK)
       };
 
-      const res = await fetch('/api/data-sources/search', {
+      const res = await fetch(`${RAG_URL}/api/data-sources/search`, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload)
@@ -177,7 +178,7 @@ export default function RagCreatePage() {
         const headers = { 'Accept': 'application/json' };
         if (token) headers['Authorization'] = `Bearer ${token}`;
 
-        const res = await fetch(`/api/data-sources/${createdBaseId}`, { headers });
+        const res = await fetch(`${RAG_URL}/api/data-sources/${createdBaseId}`, { headers });
         if (res.ok && isMounted) {
           const data = await res.json();
           if (data.name) setName(data.name);
@@ -313,7 +314,7 @@ export default function RagCreatePage() {
         formData.append('files', file);
       });
 
-      const response = await fetch('/api/data-sources/ingest-files', {
+      const response = await fetch(`${RAG_URL}/api/data-sources/ingest-files`, {
         method: 'POST',
         headers: {
           ...(token ? { 'Authorization': `Bearer ${token}` } : {})
@@ -381,7 +382,7 @@ export default function RagCreatePage() {
         agentic_config: { max_chunk_size: 800, min_chunk_size: 100 }
       };
 
-      const response = await fetch(`/api/data-sources/${createdBaseId}/chunk`, {
+      const response = await fetch(`${RAG_URL}/api/data-sources/${createdBaseId}/chunk`, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload)

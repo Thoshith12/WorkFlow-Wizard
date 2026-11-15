@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { getToken } from '../utils/auth';
+import { TOOLS_URL } from '../utils/apiConfig';
 
 export default function ToolsPage() {
   const [tools, setTools] = useState([]);
@@ -21,7 +22,7 @@ export default function ToolsPage() {
       const headers = { 'Accept': 'application/json' };
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
-      const response = await fetch('http://localhost:8002/api/tools', { headers });
+      const response = await fetch(`${TOOLS_URL}/api/tools`, { headers });
       if (response.ok) {
         const data = await response.json();
         setTools(data);

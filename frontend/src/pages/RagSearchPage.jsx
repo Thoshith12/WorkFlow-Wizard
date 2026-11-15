@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { getToken } from '../utils/auth';
+import { RAG_URL } from '../utils/apiConfig';
 
 export default function RagSearchPage() {
   const [searchParams] = useSearchParams();
@@ -31,7 +32,7 @@ export default function RagSearchPage() {
       const headers = { 'Accept': 'application/json' };
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
-      const res = await fetch('/api/data-sources', { headers });
+      const res = await fetch(`${RAG_URL}/api/data-sources`, { headers });
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data)) {
@@ -85,7 +86,7 @@ export default function RagSearchPage() {
         top_k: Number(topK)
       };
 
-      const res = await fetch('/api/data-sources/search', {
+      const res = await fetch(`${RAG_URL}/api/data-sources/search`, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload)

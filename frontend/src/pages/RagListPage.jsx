@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getToken } from '../utils/auth';
+import { RAG_URL } from '../utils/apiConfig';
 
 function formatRelativeTime(dateStr) {
   if (!dateStr) return 'Just now';
@@ -76,7 +77,7 @@ export default function RagListPage() {
       const headers = { 'Accept': 'application/json' };
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
-      const response = await fetch('/api/data-sources', { headers });
+      const response = await fetch(`${RAG_URL}/api/data-sources`, { headers });
       if (response.ok) {
         const data = await response.json();
         if (Array.isArray(data)) {
@@ -129,7 +130,7 @@ export default function RagListPage() {
       const headers = { 'Accept': 'application/json' };
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
-      const response = await fetch(`/api/data-sources/${id}`, {
+      const response = await fetch(`${RAG_URL}/api/data-sources/${id}`, {
         method: 'DELETE',
         headers
       });

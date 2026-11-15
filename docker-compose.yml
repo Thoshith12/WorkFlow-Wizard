@@ -173,6 +173,7 @@ services:
 
   # ── RAG microservice ────────────────────────────────────────────────────────
   rag-service:
+    profiles: [rag]
     build:
       context: ./backend
       dockerfile: services/rag-service/Dockerfile
@@ -217,6 +218,7 @@ services:
 
   # ── Celery workers ──────────────────────────────────────────────────────────
   rag-celery-worker:
+    profiles: [rag]
     build:
       context: ./backend
       dockerfile: services/rag-service/Dockerfile.worker

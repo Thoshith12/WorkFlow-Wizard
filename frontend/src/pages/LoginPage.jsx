@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { BACKEND_URL } from '../utils/apiConfig';
 
 export default function LoginPage() {
   const [username, setUsername] = useState('admin');
@@ -30,7 +31,7 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      const response = await fetch('/api/auth/admin-login', {
+      const response = await fetch(`${BACKEND_URL}/api/auth/admin-login`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
